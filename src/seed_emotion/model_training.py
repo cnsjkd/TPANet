@@ -12,6 +12,7 @@ import json
 import hashlib
 import math
 import os
+import argparse
 from collections import Counter
 from pathlib import Path
 
@@ -487,15 +488,30 @@ def check_class_distribution(labels, dataset_name="Dataset", log_file=None):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--data_dir",
+        default=os.getenv(
+            "SEED_CHUNKS_DIR",
+            str(Path(__file__).resolve().parents[2] / "data" / "SEED_chunks"),
+        ),
+        help="Directory containing preprocessed SEED chunk .npz files",
+    )
+    ap.add_argument(
+        "--bert",
+        default=os.getenv("BERT_MODEL_DIR"),
+        help="BERT model directory or model id (defaults to local models/bert-base-uncased if present)",
+    )
+    args = ap.parse_args()
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     log_path = Path(__file__).resolve().parents[2] / "results_confusion_matrix.txt"
     with open(log_path, "w") as log_file:
         global bert_model, tokenizer
         default_bert_dir = Path(__file__).resolve().parents[2] / "models" / "bert-base-uncased"
-        bert_env = os.getenv("BERT_MODEL_DIR")
-        if bert_env:
-            bert_path = bert_env
+        if args.bert:
+            bert_path = args.bert
         elif default_bert_dir.exists():
             bert_path = str(default_bert_dir)
         else:
@@ -511,8 +527,17 @@ def main():
         for param in bert_model.parameters():
             param.requires_grad = False
 
-        data_root = Path(__file__).resolve().parents[2] / "data" / "SEED_chunks"
-        preprocessed_files = [f for f in data_root.iterdir() if f.suffix == '.npz']
+        data_root = Path(args.data_dir).expanduser()
+        if not data_root.exists():
+            raise FileNotFoundError(f"未找到数据目录: {data_root}")
+        preprocessed_files = sorted([f for f in data_root.iterdir() if f.suffix == '.npz'])
+        print(f"Found {len(preprocessed_files)} files in {data_root}")
+        log_file.write(f"Found {len(preprocessed_files)} files in {data_root}\n")
+        if not preprocessed_files:
+            raise RuntimeError(
+                f"目录 {data_root} 下未找到 .npz 文件。"
+                "请通过 --data_dir 指向真实的 SEED_chunks 路径。"
+            )
 
         metrics_per_fold = []
 
@@ -544,6 +569,14 @@ def main():
             )
             check_class_distribution(y_train_val, "Train_Val Dataset", log_file)
             check_class_distribution(y_test, "Test Dataset", log_file)
+
+            # Prompt ablation mode: one of {"original","generic","shuffle","random","soft"}.
+            prompt_mode = os.getenv("PROMPT_MODE", "original").strip().lower()
+            # Prompt embedding mode:
+            #   - online: run BERT forward each iteration (slow)
+            #   - cached: load per-sample cached last_hidden_state (recommended)
+            prompt_emb_mode = os.getenv("PROMPT_EMB_MODE", "cached").strip().lower()
+            use_cached_prompts = (prompt_emb_mode == "cached")
 
             prompt_cache_cpu = None
             if use_cached_prompts and prompt_mode != "soft":
@@ -602,15 +635,6 @@ def main():
                 patch_embedding = PatchEmbedding(patch_len=500, d_model=128, stride=250, num_channels=62).to(device)
                 reprogramming_layer = ReprogrammingLayer(embed_dim=128, llm_embed_dim=768, num_heads=8, max_len=5000).to(device)
                 classification_head = ClassificationHead(llm_embed_dim=768, num_labels=len(np.unique(y_train))).to(device)
-
-                # Prompt ablation mode: one of {"original","generic","shuffle","random","soft"}
-                # Set prompt_mode to run reviewer-required ablations without changing model capacity.
-                prompt_mode = os.getenv("PROMPT_MODE", "original").strip().lower()
-                # Prompt embedding mode:
-                #   - online: run BERT forward each iteration (slow)
-                #   - cached: load per-sample cached last_hidden_state (recommended)
-                prompt_emb_mode = os.getenv("PROMPT_EMB_MODE", "cached").strip().lower()
-                use_cached_prompts = (prompt_emb_mode == "cached")
 
                 # Learnable soft prompt (capacity-controlled baseline). Only used when prompt_mode == "soft".
                 soft_prompt = None
