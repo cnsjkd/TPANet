@@ -610,19 +610,46 @@ class PromptCacheManager:
 
     def get_batch_embeddings(self, batch_file_ids, batch_local_idx, device):
         if torch.is_tensor(batch_file_ids):
-            file_ids = batch_file_ids.detach().cpu().tolist()
+            file_ids = batch_file_ids.detach().cpu().numpy().astype(np.int64, copy=False)
         else:
-            file_ids = list(batch_file_ids)
+            file_ids = np.asarray(list(batch_file_ids), dtype=np.int64)
         if torch.is_tensor(batch_local_idx):
-            local_idx = batch_local_idx.detach().cpu().tolist()
+            local_idx = batch_local_idx.detach().cpu().numpy().astype(np.int64, copy=False)
         else:
-            local_idx = list(batch_local_idx)
+            local_idx = np.asarray(list(batch_local_idx), dtype=np.int64)
 
-        rows = []
-        for fid, lidx in zip(file_ids, local_idx):
-            cache_tensor = self._get_cache_tensor(int(fid))
-            rows.append(cache_tensor[int(lidx)])
-        return torch.stack(rows, dim=0).to(device).float()
+        n = int(file_ids.shape[0])
+        if n == 0:
+            raise RuntimeError("空批次无法提取 prompt embeddings。")
+
+        # Group by file id to avoid repeatedly fetching the same cache tensor.
+        order = np.argsort(file_ids, kind="stable")
+        sorted_fids = file_ids[order]
+        sorted_lidx = local_idx[order]
+
+        out_cpu = None
+        pos = 0
+        while pos < n:
+            fid = int(sorted_fids[pos])
+            end = pos + 1
+            while end < n and int(sorted_fids[end]) == fid:
+                end += 1
+
+            cache_tensor = self._get_cache_tensor(fid)
+            idx_tensor = torch.as_tensor(sorted_lidx[pos:end], dtype=torch.long)
+            gathered = cache_tensor.index_select(0, idx_tensor)
+
+            if out_cpu is None:
+                out_cpu = torch.empty(
+                    (n, gathered.size(1), gathered.size(2)),
+                    dtype=gathered.dtype,
+                )
+
+            target_idx = torch.as_tensor(order[pos:end], dtype=torch.long)
+            out_cpu.index_copy_(0, target_idx, gathered)
+            pos = end
+
+        return out_cpu.to(device).float()
 
     def get_first_embeddings(self, batch_size, device):
         if not self.file_paths:
@@ -651,6 +678,9 @@ def train_model(
     soft_prompt=None,
     prompt_cache_cpu=None,
     prompt_cache_manager=None,
+    progress_callback=None,
+    progress_every_steps=0,
+    progress_prefix="",
     use_cached_prompts=False,
 ):
     bert_model, patch_embedding, reprogramming_layer, classification_head = model_components
@@ -661,7 +691,8 @@ def train_model(
     total_loss = 0
     effective_steps = 0
 
-    for batch in dataloader:
+    total_steps = len(dataloader)
+    for step_idx, batch in enumerate(dataloader, start=1):
         if len(batch) == 5:
             batch_eeg, batch_labels, batch_idx, batch_file_ids, batch_local_idx = batch
         elif len(batch) == 3:
@@ -720,6 +751,16 @@ def train_model(
 
             total_loss += loss.item()
             effective_steps += 1
+            if progress_callback is not None and progress_every_steps > 0 and (step_idx % progress_every_steps == 0):
+                avg_loss = total_loss / max(1, effective_steps)
+                msg = (
+                    f"{progress_prefix} step {step_idx}/{total_steps}, "
+                    f"effective_steps={effective_steps}, avg_loss={avg_loss:.6f}"
+                )
+                try:
+                    progress_callback(msg)
+                except Exception:
+                    pass
         except Exception as exc:
             if device.type == "cuda" and _is_cuda_oom_error(exc):
                 optimizer.zero_grad(set_to_none=True)
@@ -1000,6 +1041,12 @@ def main():
         help="How many file-level prompt caches can stay in CPU memory simultaneously.",
     )
     ap.add_argument(
+        "--log_every_steps",
+        type=int,
+        default=int(os.getenv("LOG_EVERY_STEPS", "200")),
+        help="Write training progress to xlsx every N steps (0 disables step-level logging).",
+    )
+    ap.add_argument(
         "--profile_batch_size",
         type=int,
         default=int(os.getenv("PROFILE_BATCH_SIZE", "8")),
@@ -1030,6 +1077,10 @@ def main():
     with XlsxTextLogger(log_path) as log_file:
         global bert_model, tokenizer
         bert_path = str(Path(args.bert).expanduser())
+
+        def write_progress(message):
+            print(message)
+            log_file.write(f"{message}\n")
 
         _validate_local_bert_weights(bert_path)
         tokenizer = BertTokenizer.from_pretrained(bert_path)
@@ -1071,6 +1122,15 @@ def main():
         #   - cached: load per-sample cached last_hidden_state (recommended)
         prompt_emb_mode = os.getenv("PROMPT_EMB_MODE", "cached").strip().lower()
         use_cached_prompts = (prompt_emb_mode == "cached")
+        log_every_steps = max(0, int(args.log_every_steps))
+
+        if use_cached_prompts and args.cache_files_in_mem <= 1:
+            warn_msg = (
+                "[性能提示] --cache_files_in_mem=1 在 shuffle 训练下会非常慢，"
+                "建议设置为 4-8（内存允许时）。"
+            )
+            print(warn_msg)
+            log_file.write(f"{warn_msg}\n")
 
         metrics_per_subject = []
         batch_size = max(1, args.batch_size)
@@ -1227,6 +1287,9 @@ def main():
                         prompt_mode=prompt_mode,
                         soft_prompt=soft_prompt,
                         prompt_cache_manager=prompt_cache_train,
+                        progress_callback=write_progress,
+                        progress_every_steps=log_every_steps,
+                        progress_prefix=f"    [S{held_out_subject} F{fold} E{epoch + 1}]",
                         use_cached_prompts=use_cached_prompts,
                     )
 
