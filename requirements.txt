@@ -4,3 +4,4 @@ scipy>=1.10
 scikit-learn>=1.2
 torch>=1.13
 transformers>=4.30
+openpyxl>=3.1

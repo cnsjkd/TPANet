@@ -76,8 +76,10 @@ export PYTHONPATH=$(pwd)/src:$PYTHONPATH
    ```bash
    python -m seed_emotion.model_training
    ```
-   - 输入：`data/SEED_chunks/*.npz`
-   - 日志：`results_confusion_matrix.txt`（记录五折交叉验证与独立测试集指标）
+   - 默认输入：`/home/aispeech/codes/zxy/SEED_chunks`
+   - 默认 BERT：`/home/aispeech/codes/zxy/TPANet-main/TPANet-main3/models/bert-base-uncased`
+   - 日志：`results_confusion_matrix.xlsx`（训练中边跑边写入，异常中断时已写内容不会丢）
+   - 默认 `batch_size=16`（降低 OOM 风险）
 
 建议在具备 GPU 的环境下运行模型训练，否则训练时间会明显延长。
 

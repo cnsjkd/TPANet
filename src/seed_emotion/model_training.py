@@ -13,12 +13,14 @@ import hashlib
 import math
 import os
 import argparse
+import time
 from collections import Counter
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
+from openpyxl import Workbook, load_workbook
 from sklearn.metrics import (accuracy_score, classification_report,
                              confusion_matrix, f1_score, precision_score,
                              recall_score)
@@ -26,6 +28,10 @@ from sklearn.model_selection import KFold, train_test_split
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from transformers import BertModel, BertTokenizer
+
+
+DEFAULT_DATA_DIR = "/home/aispeech/codes/zxy/SEED_chunks"
+DEFAULT_BERT_DIR = "/home/aispeech/codes/zxy/TPANet-main/TPANet-main3/models/bert-base-uncased"
 
 
 def _is_git_lfs_pointer(file_path: Path) -> bool:
@@ -57,6 +63,55 @@ def _validate_local_bert_weights(bert_path: str) -> None:
             "  - model.safetensors\n"
             "下载完成后重新运行脚本即可。"
         )
+
+
+def _is_cuda_oom_error(exc: Exception) -> bool:
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
+class XlsxTextLogger:
+    def __init__(self, file_path):
+        self.file_path = Path(file_path)
+        self.sheet_name = "logs"
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.file_path.exists():
+            self.workbook = load_workbook(self.file_path)
+        else:
+            self.workbook = Workbook()
+
+        if self.sheet_name in self.workbook.sheetnames:
+            self.worksheet = self.workbook[self.sheet_name]
+        else:
+            self.worksheet = self.workbook.active
+            self.worksheet.title = self.sheet_name
+            self.worksheet.append(["timestamp", "message"])
+            self._flush()
+
+    def write(self, text):
+        if text is None:
+            return
+        text = str(text).replace("\r\n", "\n")
+        if not text:
+            return
+        lines = text.split("\n")
+        for line in lines:
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            self.worksheet.append([timestamp, line])
+        self._flush()
+
+    def _flush(self):
+        self.workbook.save(self.file_path)
+
+    def close(self):
+        self._flush()
+        self.workbook.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
 
 class EEGDataset(Dataset):
@@ -345,13 +400,25 @@ def build_or_load_prompt_cache(file_path, all_data, device, prompt_mode="origina
     bert_model.eval()
     all_embeds = []
     with torch.no_grad():
-        for s in range(0, N, batch_size):
-            p_batch = prompts[s:s + batch_size]
-            prompt_inputs = tokenizer(
-                p_batch, return_tensors="pt", padding="max_length", truncation=True, max_length=max_length
-            ).to(device)
-            embeds = bert_model(**prompt_inputs).last_hidden_state
-            all_embeds.append(embeds.detach().cpu().half())
+        start_idx = 0
+        current_bs = max(1, int(batch_size))
+        while start_idx < N:
+            local_bs = min(current_bs, N - start_idx)
+            p_batch = prompts[start_idx:start_idx + local_bs]
+            try:
+                prompt_inputs = tokenizer(
+                    p_batch, return_tensors="pt", padding="max_length", truncation=True, max_length=max_length
+                ).to(device)
+                embeds = bert_model(**prompt_inputs).last_hidden_state
+                all_embeds.append(embeds.detach().cpu().half())
+                start_idx += local_bs
+            except Exception as exc:
+                if device.type == "cuda" and _is_cuda_oom_error(exc) and local_bs > 1:
+                    torch.cuda.empty_cache()
+                    current_bs = max(1, local_bs // 2)
+                    print(f"[OOM保护] prompt cache batch size 降为 {current_bs}")
+                    continue
+                raise
 
     cache_tensor = torch.cat(all_embeds, dim=0)  # (N, L, 768), fp16, cpu
     torch.save(cache_tensor, cache_path)
@@ -372,40 +439,48 @@ def train_model(model_components, dataloader, optimizer, criterion, device, num_
         else:
             batch_eeg, batch_labels = batch
             batch_idx = None
-        batch_eeg = batch_eeg.to(device)
-        batch_labels = batch_labels.to(device)
+        try:
+            batch_eeg = batch_eeg.to(device)
+            batch_labels = batch_labels.to(device)
 
-        optimizer.zero_grad()
+            optimizer.zero_grad()
 
-        eeg_embeddings = patch_embedding(batch_eeg)
+            eeg_embeddings = patch_embedding(batch_eeg)
 
-        min_values, max_values, median_values, trends = generate_statistics(batch_eeg)
-        prompts = generate_prompts(batch_eeg.size(0), min_values, max_values, median_values, trends, mode=prompt_mode)
-        if prompt_mode == "soft":
-            if soft_prompt is None:
-                raise ValueError("soft_prompt must be provided when prompt_mode='soft'")
-            prompt_embeddings = soft_prompt.expand(batch_eeg.size(0), -1, -1)  # (B, L, 768)
-        else:
-            if use_cached_prompts and (prompt_cache_cpu is not None) and (batch_idx is not None):
-                prompt_embeddings = prompt_cache_cpu[batch_idx].to(device).float()
+            min_values, max_values, median_values, trends = generate_statistics(batch_eeg)
+            prompts = generate_prompts(batch_eeg.size(0), min_values, max_values, median_values, trends, mode=prompt_mode)
+            if prompt_mode == "soft":
+                if soft_prompt is None:
+                    raise ValueError("soft_prompt must be provided when prompt_mode='soft'")
+                prompt_embeddings = soft_prompt.expand(batch_eeg.size(0), -1, -1)  # (B, L, 768)
             else:
-                prompt_inputs = tokenizer(
-                    prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=50
-                ).to(device)
-                with torch.no_grad():
-                    prompt_embeddings = bert_model(**prompt_inputs).last_hidden_state  # (B, L, 768)
-        eeg_embeddings, _ = reprogramming_layer(eeg_embeddings, prompt_embeddings, prompt_embeddings)
+                if use_cached_prompts and (prompt_cache_cpu is not None) and (batch_idx is not None):
+                    prompt_embeddings = prompt_cache_cpu[batch_idx].to(device).float()
+                else:
+                    prompt_inputs = tokenizer(
+                        prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=50
+                    ).to(device)
+                    with torch.no_grad():
+                        prompt_embeddings = bert_model(**prompt_inputs).last_hidden_state  # (B, L, 768)
+            eeg_embeddings, _ = reprogramming_layer(eeg_embeddings, prompt_embeddings, prompt_embeddings)
 
-        pooled_output = eeg_embeddings.mean(dim=1)
+            pooled_output = eeg_embeddings.mean(dim=1)
 
-        logits = classification_head(pooled_output)
-        loss = criterion(logits, batch_labels)
+            logits = classification_head(pooled_output)
+            loss = criterion(logits, batch_labels)
 
-        loss.backward()
+            loss.backward()
 
-        optimizer.step()
+            optimizer.step()
 
-        total_loss += loss.item()
+            total_loss += loss.item()
+        except Exception as exc:
+            if device.type == "cuda" and _is_cuda_oom_error(exc):
+                optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+                print("[OOM保护] 训练批次发生CUDA OOM，已跳过该批次。")
+                continue
+            raise
 
     average_loss = total_loss / len(dataloader)
     return average_loss
@@ -428,46 +503,56 @@ def evaluate_model(model_components, dataloader, device, num_labels, prompt_mode
             else:
                 batch_eeg, batch_labels = batch
                 batch_idx = None
-            batch_eeg = batch_eeg.to(device)
-            batch_labels = batch_labels.to(device)
+            try:
+                batch_eeg = batch_eeg.to(device)
+                batch_labels = batch_labels.to(device)
 
-            eeg_embeddings = patch_embedding(batch_eeg)
+                eeg_embeddings = patch_embedding(batch_eeg)
 
-            min_values, max_values, median_values, trends = generate_statistics(batch_eeg)
-            prompts = generate_prompts(batch_eeg.size(0), min_values, max_values, median_values, trends, mode=prompt_mode)
-            if prompt_mode == "soft":
-                if soft_prompt is None:
-                    raise ValueError("soft_prompt must be provided when prompt_mode='soft'")
-                prompt_embeddings = soft_prompt.expand(batch_eeg.size(0), -1, -1)
-            else:
-                if use_cached_prompts and (prompt_cache_cpu is not None) and (batch_idx is not None):
-                    prompt_embeddings = prompt_cache_cpu[batch_idx].to(device).float()
+                min_values, max_values, median_values, trends = generate_statistics(batch_eeg)
+                prompts = generate_prompts(batch_eeg.size(0), min_values, max_values, median_values, trends, mode=prompt_mode)
+                if prompt_mode == "soft":
+                    if soft_prompt is None:
+                        raise ValueError("soft_prompt must be provided when prompt_mode='soft'")
+                    prompt_embeddings = soft_prompt.expand(batch_eeg.size(0), -1, -1)
                 else:
-                    prompt_inputs = tokenizer(
-                        prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=50
-                    ).to(device)
-                    prompt_embeddings = bert_model(**prompt_inputs).last_hidden_state
-            eeg_embeddings, attn_weights = reprogramming_layer(eeg_embeddings, prompt_embeddings, prompt_embeddings)
+                    if use_cached_prompts and (prompt_cache_cpu is not None) and (batch_idx is not None):
+                        prompt_embeddings = prompt_cache_cpu[batch_idx].to(device).float()
+                    else:
+                        prompt_inputs = tokenizer(
+                            prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=50
+                        ).to(device)
+                        prompt_embeddings = bert_model(**prompt_inputs).last_hidden_state
+                eeg_embeddings, attn_weights = reprogramming_layer(eeg_embeddings, prompt_embeddings, prompt_embeddings)
 
-            # Optionally save attention maps for interpretability
-            if save_attn_dir is not None and max_attn_batches > 0:
-                os.makedirs(save_attn_dir, exist_ok=True)
-                # save only a few batches to avoid huge files
-                if len(os.listdir(save_attn_dir)) < max_attn_batches:
-                    try:
-                        save_attention_heatmap(attn_weights, prompts, os.path.join(save_attn_dir, f"attn_batch{len(os.listdir(save_attn_dir))}.png"))
-                    except Exception:
-                        pass
+                # Optionally save attention maps for interpretability
+                if save_attn_dir is not None and max_attn_batches > 0:
+                    os.makedirs(save_attn_dir, exist_ok=True)
+                    # save only a few batches to avoid huge files
+                    if len(os.listdir(save_attn_dir)) < max_attn_batches:
+                        try:
+                            save_attention_heatmap(attn_weights, prompts, os.path.join(save_attn_dir, f"attn_batch{len(os.listdir(save_attn_dir))}.png"))
+                        except Exception:
+                            pass
 
-            pooled_output = eeg_embeddings.mean(dim=1)
+                pooled_output = eeg_embeddings.mean(dim=1)
 
-            logits = classification_head(pooled_output)
-            predictions = torch.argmax(logits, dim=1)
+                logits = classification_head(pooled_output)
+                predictions = torch.argmax(logits, dim=1)
 
-            all_labels.extend(batch_labels.cpu().numpy())
-            all_predictions.extend(predictions.cpu().numpy())
+                all_labels.extend(batch_labels.cpu().numpy())
+                all_predictions.extend(predictions.cpu().numpy())
+            except Exception as exc:
+                if device.type == "cuda" and _is_cuda_oom_error(exc):
+                    torch.cuda.empty_cache()
+                    print("[OOM保护] 评估批次发生CUDA OOM，已跳过该批次。")
+                    continue
+                raise
 
-    report = classification_report(all_labels, all_predictions, zero_division=0)
+    if not all_labels:
+        raise RuntimeError("评估阶段全部批次因 OOM 被跳过，请减小 --batch_size。")
+
+    _ = classification_report(all_labels, all_predictions, zero_division=0)
 
     accuracy = accuracy_score(all_labels, all_predictions)
     f1 = f1_score(all_labels, all_predictions, average='macro', zero_division=0)
@@ -493,29 +578,53 @@ def main():
         "--data_dir",
         default=os.getenv(
             "SEED_CHUNKS_DIR",
-            str(Path(__file__).resolve().parents[2] / "data" / "SEED_chunks"),
+            DEFAULT_DATA_DIR,
         ),
         help="Directory containing preprocessed SEED chunk .npz files",
     )
     ap.add_argument(
         "--bert",
-        default=os.getenv("BERT_MODEL_DIR"),
-        help="BERT model directory or model id (defaults to local models/bert-base-uncased if present)",
+        default=os.getenv("BERT_MODEL_DIR", DEFAULT_BERT_DIR),
+        help="BERT model directory or model id",
+    )
+    ap.add_argument(
+        "--batch_size",
+        type=int,
+        default=int(os.getenv("TRAIN_BATCH_SIZE", "16")),
+        help="Training/evaluation batch size (default=16, lower to reduce OOM risk).",
+    )
+    ap.add_argument(
+        "--cache_batch_size",
+        type=int,
+        default=int(os.getenv("CACHE_BATCH_SIZE", "16")),
+        help="Batch size used when precomputing prompt cache (default=16).",
+    )
+    ap.add_argument(
+        "--profile_batch_size",
+        type=int,
+        default=int(os.getenv("PROFILE_BATCH_SIZE", "8")),
+        help="Batch size for efficiency profiling.",
+    )
+    ap.add_argument(
+        "--profile_iters",
+        type=int,
+        default=int(os.getenv("PROFILE_ITERS", "50")),
+        help="Iterations for efficiency profiling.",
+    )
+    ap.add_argument(
+        "--profile_warmup",
+        type=int,
+        default=int(os.getenv("PROFILE_WARMUP", "10")),
+        help="Warmup iterations for efficiency profiling.",
     )
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    log_path = Path(__file__).resolve().parents[2] / "results_confusion_matrix.txt"
-    with open(log_path, "w") as log_file:
+    log_path = Path(__file__).resolve().parents[2] / "results_confusion_matrix.xlsx"
+    with XlsxTextLogger(log_path) as log_file:
         global bert_model, tokenizer
-        default_bert_dir = Path(__file__).resolve().parents[2] / "models" / "bert-base-uncased"
-        if args.bert:
-            bert_path = args.bert
-        elif default_bert_dir.exists():
-            bert_path = str(default_bert_dir)
-        else:
-            bert_path = "bert-base-uncased"
+        bert_path = str(Path(args.bert).expanduser())
 
         _validate_local_bert_weights(bert_path)
         tokenizer = BertTokenizer.from_pretrained(bert_path)
@@ -586,10 +695,10 @@ def main():
                     device=device,
                     prompt_mode=prompt_mode,
                     max_length=50,
-                    batch_size=64,
+                    batch_size=max(1, args.cache_batch_size),
                 )
 
-            batch_size = 32
+            batch_size = max(1, args.batch_size)
 
             test_dataset = TensorDataset(
                 torch.tensor(X_test, dtype=torch.float32),
@@ -649,7 +758,9 @@ def main():
                     eff_path = Path(__file__).resolve().parents[2] / "efficiency.jsonl"
                     eff = profile_efficiency(
                         model_components, device,
-                        batch_size=32, iters=200, warmup=50,
+                        batch_size=max(1, args.profile_batch_size),
+                        iters=max(1, args.profile_iters),
+                        warmup=max(0, args.profile_warmup),
                         prompt_mode=prompt_mode, soft_prompt=soft_prompt,
                         prompt_cache_cpu=prompt_cache_cpu, use_cached_prompts=use_cached_prompts,
                     )
@@ -685,12 +796,6 @@ def main():
                     train_loss = train_model(
                         model_components,
                         train_loader, optimizer, criterion, device, len(np.unique(y_train)),
-                        prompt_mode=prompt_mode, soft_prompt=soft_prompt, prompt_cache_cpu=prompt_cache_cpu, use_cached_prompts=use_cached_prompts,
-                    )
-
-                    val_accuracy, val_f1, val_precision, val_recall, val_conf_matrix = evaluate_model(
-                        model_components,
-                        val_loader, device, len(np.unique(y_train)),
                         prompt_mode=prompt_mode, soft_prompt=soft_prompt, prompt_cache_cpu=prompt_cache_cpu, use_cached_prompts=use_cached_prompts,
                     )
 
