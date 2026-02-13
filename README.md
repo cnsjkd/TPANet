@@ -35,7 +35,7 @@ TPANet/
    pip install -r requirements.txt
    ```
 
-3. 若已下载 `bert-base-uncased` 到 `models/bert-base-uncased/`，运行训练脚本时会优先读取该目录；也可通过环境变量 `BERT_MODEL_DIR` 指向其他路径。
+3. 训练脚本默认读取本地目录 `models/bert-base-uncased/`（对应绝对路径 `/home/aispeech/codes/zxy/TPANet-main/TPANet-main2/models/bert-base-uncased`）。
 4. 若代码通过 Git 克隆，需确保已拉取 LFS 大文件，否则 `models/bert-base-uncased/pytorch_model.bin` 可能只是指针文件（约 100 多字节）：
 
    ```bash
@@ -77,9 +77,31 @@ export PYTHONPATH=$(pwd)/src:$PYTHONPATH
    python -m seed_emotion.model_training
    ```
    - 默认输入：`/home/aispeech/codes/zxy/SEED_chunks`
-   - 默认 BERT：`/home/aispeech/codes/zxy/TPANet-main/TPANet-main3/models/bert-base-uncased`
+   - 默认 BERT：`/home/aispeech/codes/zxy/TPANet-main/TPANet-main2/models/bert-base-uncased`
    - 日志：`results_confusion_matrix.xlsx`（训练中边跑边写入，异常中断时已写内容不会丢）
+   - 运行时性能日志：`runtime_metrics.jsonl`（包含 `epoch_train` / `fold_train` / `subject_train_summary` / `test_inference` 的真实耗时与吞吐）
    - 默认 `batch_size=16`（降低 OOM 风险）
+
+4. **可解释性可视化（审稿回复推荐）**
+   1. 分别运行四种 prompt 模式（会自动在 `attn_records/<mode>/` 下保存测试集 attention 记录）：
+      ```bash
+      PROMPT_EMB_MODE=cached PROMPT_MODE=original python src/seed_emotion/model_training.py
+      PROMPT_EMB_MODE=cached PROMPT_MODE=generic  python src/seed_emotion/model_training.py
+      PROMPT_EMB_MODE=cached PROMPT_MODE=shuffle  python src/seed_emotion/model_training.py
+      PROMPT_EMB_MODE=cached PROMPT_MODE=random   python src/seed_emotion/model_training.py
+      ```
+   2. 汇总绘图：
+      ```bash
+      python scripts/plot_attention_interpretability.py \
+        --records_root ./attn_records \
+        --out_dir ./attn_figures \
+        --modes original,generic,shuffle,random
+      ```
+   3. 主要输出：
+      - `attn_figures/attn_mode_class_heatmaps.png`：`mode x class` 平均 Attention 热图
+      - `attn_figures/attn_delta_original_minus_random.png`：`original - random` 差分图
+      - `attn_figures/attn_token_group_boxplots.png`：语义词/数字词 attention 质量分布箱线图
+      - `attn_figures/attn_interpretability_summary.json`：样本量与输入文件清单
 
 建议在具备 GPU 的环境下运行模型训练，否则训练时间会明显延长。
 

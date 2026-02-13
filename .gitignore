@@ -3,3 +3,7 @@ prompt_cache/
 models/bert-base-uncased/
 results_confusion_matrix.txt
 attn_viz/models/
+*.xlsx
+attn_viz/
+attn_records/
+*.jsonl

@@ -31,7 +31,7 @@ from transformers import BertModel, BertTokenizer
 
 
 DEFAULT_DATA_DIR = "/home/aispeech/codes/zxy/SEED_chunks"
-DEFAULT_BERT_DIR = "/home/aispeech/codes/zxy/TPANet-main/TPANet-main3/models/bert-base-uncased"
+DEFAULT_BERT_DIR = "/home/aispeech/codes/zxy/TPANet-main/TPANet-main2/models/bert-base-uncased"
 
 
 def _is_git_lfs_pointer(file_path: Path) -> bool:
@@ -65,8 +65,33 @@ def _validate_local_bert_weights(bert_path: str) -> None:
         )
 
 
+def _resolve_bert_source(bert_arg: str) -> str:
+    raw_value = str(bert_arg).strip()
+    if not raw_value:
+        raise ValueError("参数 --bert 不能为空。")
+
+    expanded_path = Path(raw_value).expanduser()
+    if not expanded_path.is_dir():
+        raise FileNotFoundError(
+            f"未找到 BERT 本地目录: {expanded_path}\n"
+            "请确认路径存在，或通过 --bert 显式指定有效本地目录。"
+        )
+    return str(expanded_path)
+
+
 def _is_cuda_oom_error(exc: Exception) -> bool:
     return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
+def _sync_cuda_if_needed(device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def _append_jsonl(file_path: Path, record: dict) -> None:
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(file_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 class XlsxTextLogger:
@@ -300,6 +325,20 @@ def save_attention_heatmap(attn_weights, prompts, save_path, token_limit=30):
     plt.close()
 
 
+def save_attention_records(attn_blocks, token_id_blocks, label_blocks, save_path):
+    """Persist aggregated per-sample attention tensors for post-hoc interpretability plots."""
+    if save_path is None or (not attn_blocks):
+        return
+
+    out_path = Path(save_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    attn = np.concatenate(attn_blocks, axis=0).astype(np.float16)
+    token_ids = np.concatenate(token_id_blocks, axis=0).astype(np.int32)
+    labels = np.concatenate(label_blocks, axis=0).astype(np.int64)
+    np.savez_compressed(out_path, attn=attn, token_ids=token_ids, labels=labels)
+
+
 def profile_efficiency(model_components, device, batch_size=32, iters=200, warmup=50, prompt_mode="original", soft_prompt=None, prompt_cache_cpu=None, use_cached_prompts=False):
     """Measure params + inference latency (per forward) + peak GPU memory."""
     import time
@@ -486,7 +525,20 @@ def train_model(model_components, dataloader, optimizer, criterion, device, num_
     return average_loss
 
 
-def evaluate_model(model_components, dataloader, device, num_labels, prompt_mode="original", soft_prompt=None, save_attn_dir=None, max_attn_batches=1, prompt_cache_cpu=None, use_cached_prompts=False):
+def evaluate_model(
+    model_components,
+    dataloader,
+    device,
+    num_labels,
+    prompt_mode="original",
+    soft_prompt=None,
+    save_attn_dir=None,
+    max_attn_batches=1,
+    prompt_cache_cpu=None,
+    use_cached_prompts=False,
+    save_attn_npz_path=None,
+    return_timing=False,
+):
     bert_model, patch_embedding, reprogramming_layer, classification_head = model_components
     bert_model.eval()
     patch_embedding.eval()
@@ -495,6 +547,13 @@ def evaluate_model(model_components, dataloader, device, num_labels, prompt_mode
 
     all_labels = []
     all_predictions = []
+    all_attn_blocks = []
+    all_token_id_blocks = []
+    all_label_blocks = []
+    eval_batches = 0
+
+    _sync_cuda_if_needed(device)
+    infer_start = time.perf_counter()
 
     with torch.no_grad():
         for batch in dataloader:
@@ -511,6 +570,16 @@ def evaluate_model(model_components, dataloader, device, num_labels, prompt_mode
 
                 min_values, max_values, median_values, trends = generate_statistics(batch_eeg)
                 prompts = generate_prompts(batch_eeg.size(0), min_values, max_values, median_values, trends, mode=prompt_mode)
+                prompt_inputs = None
+                if prompt_mode != "soft":
+                    need_prompt_inputs = (
+                        (save_attn_npz_path is not None)
+                        or not (use_cached_prompts and (prompt_cache_cpu is not None) and (batch_idx is not None))
+                    )
+                    if need_prompt_inputs:
+                        prompt_inputs = tokenizer(
+                            prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=50
+                        )
                 if prompt_mode == "soft":
                     if soft_prompt is None:
                         raise ValueError("soft_prompt must be provided when prompt_mode='soft'")
@@ -519,10 +588,11 @@ def evaluate_model(model_components, dataloader, device, num_labels, prompt_mode
                     if use_cached_prompts and (prompt_cache_cpu is not None) and (batch_idx is not None):
                         prompt_embeddings = prompt_cache_cpu[batch_idx].to(device).float()
                     else:
-                        prompt_inputs = tokenizer(
-                            prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=50
-                        ).to(device)
-                        prompt_embeddings = bert_model(**prompt_inputs).last_hidden_state
+                        if prompt_inputs is None:
+                            prompt_inputs = tokenizer(
+                                prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=50
+                            )
+                        prompt_embeddings = bert_model(**prompt_inputs.to(device)).last_hidden_state
                 eeg_embeddings, attn_weights = reprogramming_layer(eeg_embeddings, prompt_embeddings, prompt_embeddings)
 
                 # Optionally save attention maps for interpretability
@@ -535,6 +605,20 @@ def evaluate_model(model_components, dataloader, device, num_labels, prompt_mode
                         except Exception:
                             pass
 
+                if save_attn_npz_path is not None:
+                    attn_mean_head = attn_weights.mean(dim=1).detach().cpu().numpy().astype(np.float16)
+                    if prompt_mode == "soft":
+                        token_ids = np.full((attn_mean_head.shape[0], attn_mean_head.shape[-1]), -1, dtype=np.int32)
+                    else:
+                        if prompt_inputs is None:
+                            prompt_inputs = tokenizer(
+                                prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=50
+                            )
+                        token_ids = prompt_inputs["input_ids"].cpu().numpy().astype(np.int32)
+                    all_attn_blocks.append(attn_mean_head)
+                    all_token_id_blocks.append(token_ids)
+                    all_label_blocks.append(batch_labels.detach().cpu().numpy().astype(np.int64))
+
                 pooled_output = eeg_embeddings.mean(dim=1)
 
                 logits = classification_head(pooled_output)
@@ -542,6 +626,7 @@ def evaluate_model(model_components, dataloader, device, num_labels, prompt_mode
 
                 all_labels.extend(batch_labels.cpu().numpy())
                 all_predictions.extend(predictions.cpu().numpy())
+                eval_batches += 1
             except Exception as exc:
                 if device.type == "cuda" and _is_cuda_oom_error(exc):
                     torch.cuda.empty_cache()
@@ -549,8 +634,13 @@ def evaluate_model(model_components, dataloader, device, num_labels, prompt_mode
                     continue
                 raise
 
+    _sync_cuda_if_needed(device)
+    infer_time_sec = time.perf_counter() - infer_start
+
     if not all_labels:
         raise RuntimeError("评估阶段全部批次因 OOM 被跳过，请减小 --batch_size。")
+
+    save_attention_records(all_attn_blocks, all_token_id_blocks, all_label_blocks, save_attn_npz_path)
 
     _ = classification_report(all_labels, all_predictions, zero_division=0)
 
@@ -559,6 +649,17 @@ def evaluate_model(model_components, dataloader, device, num_labels, prompt_mode
     precision = precision_score(all_labels, all_predictions, average='macro', zero_division=0)
     recall = recall_score(all_labels, all_predictions, average='macro', zero_division=0)
     conf_matrix = confusion_matrix(all_labels, all_predictions)
+    infer_samples = len(all_labels)
+    throughput = infer_samples / infer_time_sec if infer_time_sec > 0 else 0.0
+
+    if return_timing:
+        timing_info = {
+            "inference_time_sec": float(infer_time_sec),
+            "inference_samples": int(infer_samples),
+            "inference_batches": int(eval_batches),
+            "throughput_samples_per_sec": float(throughput),
+        }
+        return accuracy, f1, precision, recall, conf_matrix, timing_info
 
     return accuracy, f1, precision, recall, conf_matrix
 
@@ -584,8 +685,8 @@ def main():
     )
     ap.add_argument(
         "--bert",
-        default=os.getenv("BERT_MODEL_DIR", DEFAULT_BERT_DIR),
-        help="BERT model directory or model id",
+        default=DEFAULT_BERT_DIR,
+        help="Local BERT model directory",
     )
     ap.add_argument(
         "--batch_size",
@@ -622,16 +723,27 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     log_path = Path(__file__).resolve().parents[2] / "results_confusion_matrix.xlsx"
+    runtime_path = Path(__file__).resolve().parents[2] / "runtime_metrics.jsonl"
     with XlsxTextLogger(log_path) as log_file:
         global bert_model, tokenizer
-        bert_path = str(Path(args.bert).expanduser())
+        bert_path = _resolve_bert_source(args.bert)
 
         _validate_local_bert_weights(bert_path)
-        tokenizer = BertTokenizer.from_pretrained(bert_path)
+        tokenizer = BertTokenizer.from_pretrained(
+            bert_path,
+            local_files_only=True,
+        )
         try:
-            bert_model = BertModel.from_pretrained(bert_path, weights_only=False).to(device)
+            bert_model = BertModel.from_pretrained(
+                bert_path,
+                weights_only=False,
+                local_files_only=True,
+            ).to(device)
         except TypeError:
-            bert_model = BertModel.from_pretrained(bert_path).to(device)
+            bert_model = BertModel.from_pretrained(
+                bert_path,
+                local_files_only=True,
+            ).to(device)
 
         for param in bert_model.parameters():
             param.requires_grad = False
@@ -651,6 +763,10 @@ def main():
         metrics_per_fold = []
 
         for file_path in preprocessed_files:
+            subject_wall_start = time.perf_counter()
+            subject_train_time_sec = 0.0
+            subject_epochs = 0
+            subject_folds = 0
             print(f"\nProcessing file: {file_path}")
             log_file.write(f"\nProcessing file: {file_path}\n")
 
@@ -712,8 +828,11 @@ def main():
             kf = KFold(n_splits=5, shuffle=True, random_state=42)
             data_indices = np.arange(len(X_train_val))
             for train_indices, val_indices in kf.split(data_indices):
-                print(f'Fold {fold}:')
-                log_file.write(f'Fold {fold}:')
+                current_fold_id = int(fold)
+                fold_train_time_sec = 0.0
+                fold_epochs = 0
+                print(f'Fold {current_fold_id}:')
+                log_file.write(f'Fold {current_fold_id}:')
                 X_train, X_val = X_train_val[train_indices], X_train_val[val_indices]
                 idx_train = idx_train_val[train_indices]
                 idx_val = idx_train_val[val_indices]
@@ -793,10 +912,34 @@ def main():
                 num_epochs = 100
 
                 for epoch in range(num_epochs):
+                    _sync_cuda_if_needed(device)
+                    epoch_train_start = time.perf_counter()
                     train_loss = train_model(
                         model_components,
                         train_loader, optimizer, criterion, device, len(np.unique(y_train)),
                         prompt_mode=prompt_mode, soft_prompt=soft_prompt, prompt_cache_cpu=prompt_cache_cpu, use_cached_prompts=use_cached_prompts,
+                    )
+                    _sync_cuda_if_needed(device)
+                    epoch_train_time_sec = time.perf_counter() - epoch_train_start
+                    fold_train_time_sec += epoch_train_time_sec
+                    subject_train_time_sec += epoch_train_time_sec
+                    fold_epochs += 1
+                    subject_epochs += 1
+
+                    _append_jsonl(
+                        runtime_path,
+                        {
+                            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "scope": "epoch_train",
+                            "dataset_file": str(file_path),
+                            "prompt_mode": prompt_mode,
+                            "prompt_emb_mode": prompt_emb_mode,
+                            "fold_id": current_fold_id,
+                            "epoch_id": int(epoch + 1),
+                            "train_samples": int(len(train_dataset)),
+                            "train_batches": int(len(train_loader)),
+                            "epoch_train_time_sec": float(epoch_train_time_sec),
+                        },
                     )
 
                     val_accuracy, val_f1, val_precision, val_recall, val_conf_matrix = evaluate_model(
@@ -805,12 +948,12 @@ def main():
                         prompt_mode=prompt_mode, soft_prompt=soft_prompt, prompt_cache_cpu=prompt_cache_cpu, use_cached_prompts=use_cached_prompts,
                     )
                     print(
-                        f"    Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss}, "
+                        f"    Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss}, TrainTime(s): {epoch_train_time_sec:.3f}, "
                         f"Validation Accuracy: {val_accuracy}, F1: {val_f1}, "
                         f"Precision: {val_precision}, Recall: {val_recall}, Conf_matrix: {val_conf_matrix}"
                     )
                     log_file.write(
-                        f"    Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss}, "
+                        f"    Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss}, TrainTime(s): {epoch_train_time_sec:.3f}, "
                         f"Validation Accuracy: {val_accuracy}, F1: {val_f1}, "
                         f"Precision: {val_precision}, Recall: {val_recall}, Conf_matrix: {val_conf_matrix}\n"
                     )
@@ -848,20 +991,94 @@ def main():
                         f"    Best Validation Accuracy: {val_accuracy}, F1: {val_f1}, "
                         f"Precision: {val_precision}, Recall: {val_recall}, Conf_matrix: {val_conf_matrix}\n"
                     )
+                    _append_jsonl(
+                        runtime_path,
+                        {
+                            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "scope": "fold_train",
+                            "dataset_file": str(file_path),
+                            "prompt_mode": prompt_mode,
+                            "prompt_emb_mode": prompt_emb_mode,
+                            "fold_id": current_fold_id,
+                            "epochs_completed": int(fold_epochs),
+                            "train_samples": int(len(train_dataset)),
+                            "train_batches": int(len(train_loader)),
+                            "fold_train_time_sec": float(fold_train_time_sec),
+                        },
+                    )
+                    print(f"    Fold {current_fold_id} TrainTime(s): {fold_train_time_sec:.3f}, Epochs: {fold_epochs}")
+                    log_file.write(f"    Fold {current_fold_id} TrainTime(s): {fold_train_time_sec:.3f}, Epochs: {fold_epochs}\n")
+                    subject_folds += 1
 
                     fold += 1
 
-            test_accuracy, test_f1, test_precision, test_recall, test_conf_matrix = evaluate_model(
+            attn_record_path = (
+                Path(__file__).resolve().parents[2]
+                / "attn_records"
+                / prompt_mode
+                / f"{Path(file_path).stem}__test_attn.npz"
+            )
+            test_accuracy, test_f1, test_precision, test_recall, test_conf_matrix, test_timing = evaluate_model(
                 model_components,
-                test_loader, device, len(np.unique(y_train)), prompt_mode=prompt_mode, soft_prompt=soft_prompt, prompt_cache_cpu=prompt_cache_cpu, use_cached_prompts=use_cached_prompts, save_attn_dir=str(Path(__file__).resolve().parents[2] / "attn_viz"), max_attn_batches=1
+                test_loader,
+                device,
+                len(np.unique(y_train)),
+                prompt_mode=prompt_mode,
+                soft_prompt=soft_prompt,
+                prompt_cache_cpu=prompt_cache_cpu,
+                use_cached_prompts=use_cached_prompts,
+                save_attn_dir=str(Path(__file__).resolve().parents[2] / "attn_viz"),
+                max_attn_batches=1,
+                save_attn_npz_path=str(attn_record_path),
+                return_timing=True,
             )
             print(
                 f"*** Test Dataset Results - Accuracy: {test_accuracy}, F1: {test_f1}, "
-                f"Precision: {test_precision}, Recall: {test_recall}, Conf_matrix: {test_conf_matrix}"
+                f"Precision: {test_precision}, Recall: {test_recall}, Conf_matrix: {test_conf_matrix}, "
+                f"InferTime(s): {test_timing['inference_time_sec']:.3f}, Throughput(samples/s): {test_timing['throughput_samples_per_sec']:.3f}"
             )
             log_file.write(
                 f"*** Test Dataset Results - Accuracy: {test_accuracy}, F1: {test_f1}, "
-                f"Precision: {test_precision}, Recall: {test_recall}, Conf_matrix: {test_conf_matrix}\n"
+                f"Precision: {test_precision}, Recall: {test_recall}, Conf_matrix: {test_conf_matrix}, "
+                f"InferTime(s): {test_timing['inference_time_sec']:.3f}, Throughput(samples/s): {test_timing['throughput_samples_per_sec']:.3f}\n"
+            )
+            _append_jsonl(
+                runtime_path,
+                {
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "scope": "test_inference",
+                    "dataset_file": str(file_path),
+                    "prompt_mode": prompt_mode,
+                    "prompt_emb_mode": prompt_emb_mode,
+                    "inference_time_sec": float(test_timing["inference_time_sec"]),
+                    "inference_samples": int(test_timing["inference_samples"]),
+                    "inference_batches": int(test_timing["inference_batches"]),
+                    "throughput_samples_per_sec": float(test_timing["throughput_samples_per_sec"]),
+                },
+            )
+
+            subject_wall_time_sec = time.perf_counter() - subject_wall_start
+            _append_jsonl(
+                runtime_path,
+                {
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "scope": "subject_train_summary",
+                    "dataset_file": str(file_path),
+                    "prompt_mode": prompt_mode,
+                    "prompt_emb_mode": prompt_emb_mode,
+                    "subject_folds": int(subject_folds),
+                    "subject_epochs": int(subject_epochs),
+                    "subject_train_time_sec": float(subject_train_time_sec),
+                    "subject_total_wall_time_sec": float(subject_wall_time_sec),
+                },
+            )
+            print(
+                f"*** Subject Runtime - TrainTime(s): {subject_train_time_sec:.3f}, "
+                f"TotalWallTime(s): {subject_wall_time_sec:.3f}, Folds: {subject_folds}, Epochs: {subject_epochs}"
+            )
+            log_file.write(
+                f"*** Subject Runtime - TrainTime(s): {subject_train_time_sec:.3f}, "
+                f"TotalWallTime(s): {subject_wall_time_sec:.3f}, Folds: {subject_folds}, Epochs: {subject_epochs}\n"
             )
 
             metrics_per_fold.append({
