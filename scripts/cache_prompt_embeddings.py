@@ -13,6 +13,37 @@ import torch
 import numpy as np
 from transformers import BertModel, BertTokenizer
 
+
+def _is_git_lfs_pointer(file_path: Path) -> bool:
+    if not file_path.is_file():
+        return False
+    try:
+        if file_path.stat().st_size > 2048:
+            return False
+        text = file_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return text.startswith("version https://git-lfs.github.com/spec/v1")
+
+
+def _validate_local_bert_weights(bert_path: str) -> None:
+    model_dir = Path(bert_path)
+    if not model_dir.is_dir():
+        return
+    pytorch_bin = model_dir / "pytorch_model.bin"
+    safetensors_file = model_dir / "model.safetensors"
+    if _is_git_lfs_pointer(pytorch_bin):
+        if safetensors_file.is_file() and safetensors_file.stat().st_size > 1024 * 1024:
+            return
+        raise RuntimeError(
+            f"检测到无效模型权重: {pytorch_bin}\n"
+            "该文件是 Git LFS 指针，不是真实的 BERT 权重。\n"
+            "请下载完整权重到该目录（任选其一）：\n"
+            "  - pytorch_model.bin\n"
+            "  - model.safetensors\n"
+            "下载完成后重新运行脚本即可。"
+        )
+
 def generate_statistics(batch_data):
     min_values = torch.min(batch_data.view(batch_data.size(0), -1), dim=1).values
     max_values = torch.max(batch_data.view(batch_data.size(0), -1), dim=1).values
@@ -57,8 +88,12 @@ def main():
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _validate_local_bert_weights(args.bert)
     tokenizer = BertTokenizer.from_pretrained(args.bert)
-    bert_model = BertModel.from_pretrained(args.bert).to(device)
+    try:
+        bert_model = BertModel.from_pretrained(args.bert, weights_only=False).to(device)
+    except TypeError:
+        bert_model = BertModel.from_pretrained(args.bert).to(device)
     bert_model.eval()
     for p in bert_model.parameters():
         p.requires_grad = False
@@ -81,7 +116,13 @@ def main():
         with torch.no_grad():
             for s in range(0, X.size(0), args.batch_size):
                 p_batch = prompts[s:s+args.batch_size]
-                inp = tokenizer(p_batch, return_tensors="pt", padding=True, truncation=True, max_length=args.max_length).to(device)
+                inp = tokenizer(
+                    p_batch,
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=args.max_length,
+                ).to(device)
                 emb = bert_model(**inp).last_hidden_state.detach().cpu().half()
                 all_embeds.append(emb)
         cache = torch.cat(all_embeds, dim=0)

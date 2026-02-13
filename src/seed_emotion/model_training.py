@@ -27,6 +27,37 @@ from torch.utils.data import DataLoader, Dataset, TensorDataset
 from transformers import BertModel, BertTokenizer
 
 
+def _is_git_lfs_pointer(file_path: Path) -> bool:
+    if not file_path.is_file():
+        return False
+    try:
+        if file_path.stat().st_size > 2048:
+            return False
+        text = file_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return text.startswith("version https://git-lfs.github.com/spec/v1")
+
+
+def _validate_local_bert_weights(bert_path: str) -> None:
+    model_dir = Path(bert_path)
+    if not model_dir.is_dir():
+        return
+    pytorch_bin = model_dir / "pytorch_model.bin"
+    safetensors_file = model_dir / "model.safetensors"
+    if _is_git_lfs_pointer(pytorch_bin):
+        if safetensors_file.is_file() and safetensors_file.stat().st_size > 1024 * 1024:
+            return
+        raise RuntimeError(
+            f"检测到无效模型权重: {pytorch_bin}\n"
+            "该文件是 Git LFS 指针，不是真实的 BERT 权重。\n"
+            "请下载完整权重到该目录（任选其一）：\n"
+            "  - pytorch_model.bin\n"
+            "  - model.safetensors\n"
+            "下载完成后重新运行脚本即可。"
+        )
+
+
 class EEGDataset(Dataset):
     def __init__(self, file_path):
         self.file_path = file_path
@@ -246,7 +277,9 @@ def profile_efficiency(model_components, device, batch_size=32, iters=200, warmu
         if use_cached_prompts and (prompt_cache_cpu is not None):
             prompt_embeddings = prompt_cache_cpu[:batch_size].to(device).float()
         else:
-            prompt_inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=50).to(device)
+            prompt_inputs = tokenizer(
+                prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=50
+            ).to(device)
             with torch.no_grad():
                 prompt_embeddings = bert_model(**prompt_inputs).last_hidden_state
 
@@ -314,7 +347,7 @@ def build_or_load_prompt_cache(file_path, all_data, device, prompt_mode="origina
         for s in range(0, N, batch_size):
             p_batch = prompts[s:s + batch_size]
             prompt_inputs = tokenizer(
-                p_batch, return_tensors="pt", padding=True, truncation=True, max_length=max_length
+                p_batch, return_tensors="pt", padding="max_length", truncation=True, max_length=max_length
             ).to(device)
             embeds = bert_model(**prompt_inputs).last_hidden_state
             all_embeds.append(embeds.detach().cpu().half())
@@ -355,7 +388,9 @@ def train_model(model_components, dataloader, optimizer, criterion, device, num_
             if use_cached_prompts and (prompt_cache_cpu is not None) and (batch_idx is not None):
                 prompt_embeddings = prompt_cache_cpu[batch_idx].to(device).float()
             else:
-                prompt_inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=50).to(device)
+                prompt_inputs = tokenizer(
+                    prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=50
+                ).to(device)
                 with torch.no_grad():
                     prompt_embeddings = bert_model(**prompt_inputs).last_hidden_state  # (B, L, 768)
         eeg_embeddings, _ = reprogramming_layer(eeg_embeddings, prompt_embeddings, prompt_embeddings)
@@ -407,7 +442,9 @@ def evaluate_model(model_components, dataloader, device, num_labels, prompt_mode
                 if use_cached_prompts and (prompt_cache_cpu is not None) and (batch_idx is not None):
                     prompt_embeddings = prompt_cache_cpu[batch_idx].to(device).float()
                 else:
-                    prompt_inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=50).to(device)
+                    prompt_inputs = tokenizer(
+                        prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=50
+                    ).to(device)
                     prompt_embeddings = bert_model(**prompt_inputs).last_hidden_state
             eeg_embeddings, attn_weights = reprogramming_layer(eeg_embeddings, prompt_embeddings, prompt_embeddings)
 
@@ -464,8 +501,12 @@ def main():
         else:
             bert_path = "bert-base-uncased"
 
+        _validate_local_bert_weights(bert_path)
         tokenizer = BertTokenizer.from_pretrained(bert_path)
-        bert_model = BertModel.from_pretrained(bert_path).to(device)
+        try:
+            bert_model = BertModel.from_pretrained(bert_path, weights_only=False).to(device)
+        except TypeError:
+            bert_model = BertModel.from_pretrained(bert_path).to(device)
 
         for param in bert_model.parameters():
             param.requires_grad = False

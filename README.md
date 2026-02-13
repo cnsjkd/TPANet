@@ -36,6 +36,12 @@ TPANet/
    ```
 
 3. 若已下载 `bert-base-uncased` 到 `models/bert-base-uncased/`，运行训练脚本时会优先读取该目录；也可通过环境变量 `BERT_MODEL_DIR` 指向其他路径。
+4. 若代码通过 Git 克隆，需确保已拉取 LFS 大文件，否则 `models/bert-base-uncased/pytorch_model.bin` 可能只是指针文件（约 100 多字节）：
+
+   ```bash
+   git lfs install
+   git lfs pull --include="models/bert-base-uncased/pytorch_model.bin"
+   ```
 
 ## 数据准备
 
