@@ -80,9 +80,16 @@ def cache_path_for_file(file_path, prompt_mode):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data_dir", default=str(Path(__file__).resolve().parents[1] / "data" / "SEED_chunks"))
+    default_data_dir = Path(__file__).resolve().parents[1] / "data" / "SEED_chunks"
+    if Path("/home/xiaoying/SEED-IV_chunks").exists():
+        default_data_dir = Path("/home/xiaoying/SEED-IV_chunks")
+    ap.add_argument("--data_dir", default=str(default_data_dir))
     ap.add_argument("--mode", default=os.getenv("PROMPT_MODE", "original"))
-    ap.add_argument("--bert", default=os.getenv("BERT_MODEL_DIR", "bert-base-uncased"))
+    default_bert = os.getenv("BERT_MODEL_DIR", "bert-base-uncased")
+    local_bert = Path("/home/xiaoying/TPANet-main2/models/bert-base-uncased")
+    if local_bert.exists():
+        default_bert = str(local_bert)
+    ap.add_argument("--bert", default=default_bert)
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--max_length", type=int, default=50)
     args = ap.parse_args()
