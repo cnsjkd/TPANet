@@ -144,7 +144,12 @@ class EEGDataset(Dataset):
         self.file_path = file_path
         with np.load(file_path, allow_pickle=True) as npz_file:
             self.data = npz_file['data']
-            self.labels = npz_file['labels'] + 1
+            labels = npz_file['labels']
+            labels = np.array(labels, dtype=np.int64)
+            if labels.size == 0:
+                raise ValueError(f"{file_path} 中 labels 为空。")
+            labels = labels - labels.min()
+            self.labels = labels
 
     def __len__(self):
         return len(self.labels)
@@ -749,6 +754,8 @@ def main():
             param.requires_grad = False
 
         data_root = Path(args.data_dir).expanduser()
+        if not data_root.exists() and Path("/home/xiaoying/SEED-IV_chunks").exists():
+            data_root = Path("/home/xiaoying/SEED-IV_chunks")
         if not data_root.exists():
             raise FileNotFoundError(f"未找到数据目录: {data_root}")
         preprocessed_files = sorted([f for f in data_root.iterdir() if f.suffix == '.npz'])

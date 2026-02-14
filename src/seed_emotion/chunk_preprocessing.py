@@ -6,13 +6,23 @@ organised for reuse inside a Python package. It slices augmented EEG arrays
 into fixed-length chunks and persists them as `.npz` archives.
 """
 
+import argparse
 import os
 from pathlib import Path
 
 import numpy as np
 
 
-def preprocess_and_save_chunks_per_file(data_files, labels, chunk_size=2000, overlap=0, save_folder='preprocessed_chunks'):
+def _load_trial_labels(npz_file, fallback_labels=None):
+    if "labels" in npz_file:
+        labels = np.array(npz_file["labels"], dtype=np.int64)
+        return labels
+    if fallback_labels is None:
+        raise ValueError("未在 .npz 中找到 labels，且未提供 label.npy 作为回退。")
+    return np.array(fallback_labels, dtype=np.int64)
+
+
+def preprocess_and_save_chunks_per_file(data_files, labels=None, chunk_size=2000, overlap=0, save_folder='preprocessed_chunks'):
     save_folder = Path(save_folder)
     if not save_folder.exists():
         save_folder.mkdir(parents=True, exist_ok=True)
@@ -25,7 +35,11 @@ def preprocess_and_save_chunks_per_file(data_files, labels, chunk_size=2000, ove
         with np.load(file_path, allow_pickle=True) as npz_file:
             eeg_data = npz_file['data']
             num_trials, num_channels, num_timepoints = eeg_data.shape
-            trial_labels = labels
+            trial_labels = _load_trial_labels(npz_file, labels)
+            if len(trial_labels) != num_trials:
+                raise ValueError(
+                    f"{file_path} 标签数量({len(trial_labels)})与 trial 数量({num_trials})不一致。"
+                )
 
             for trial_idx in range(num_trials):
                 trial_data = eeg_data[trial_idx]
@@ -59,20 +73,47 @@ def preprocess_and_save_chunks_per_file(data_files, labels, chunk_size=2000, ove
 
 
 def main():
-    data_root = Path("/home/aispeech/codes/zxy/")
-    data_folder = data_root / "SEED_aug"
-    label_file = data_root / "SEED_aug" / "label.npy"
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", default=os.getenv("EEG_DATASET", "seed"), choices=["seed", "seed-iv"])
+    ap.add_argument("--data_root", default=os.getenv("EEG_DATA_ROOT", "/home/aispeech/codes/zxy/"))
+    ap.add_argument("--input_dir", default=None)
+    ap.add_argument("--output_dir", default=None)
+    ap.add_argument("--chunk_size", type=int, default=int(os.getenv("EEG_CHUNK_SIZE", "1000")))
+    ap.add_argument("--overlap", type=int, default=int(os.getenv("EEG_CHUNK_OVERLAP", "0")))
+    args = ap.parse_args()
 
-    labels = np.load(label_file, allow_pickle=True)
+    dataset = args.dataset.strip().lower()
+    data_root = Path(args.data_root).expanduser()
+    default_input = "SEED_aug" if dataset == "seed" else "SEED_IV_aug"
+    default_output = "SEED_chunks" if dataset == "seed" else "SEED_IV_chunks"
+
+    if args.input_dir:
+        data_folder = Path(args.input_dir).expanduser()
+    elif dataset == "seed-iv" and Path("/home/xiaoying/SEED-IV_aug").exists():
+        data_folder = Path("/home/xiaoying/SEED-IV_aug")
+    else:
+        data_folder = data_root / default_input
+
+    if args.output_dir:
+        save_folder = Path(args.output_dir).expanduser()
+    elif dataset == "seed-iv" and Path("/home/xiaoying").exists():
+        save_folder = Path("/home/xiaoying/SEED-IV_chunks")
+    else:
+        save_folder = data_root / default_output
+
+    label_file = data_folder / "label.npy"
+    labels = None
+    if label_file.exists():
+        labels = np.load(label_file, allow_pickle=True)
 
     data_files = [data_folder / f for f in os.listdir(data_folder) if f.endswith('.npz')]
 
     preprocess_and_save_chunks_per_file(
         data_files,
         labels,
-        chunk_size=1000,
-        overlap=0,
-        save_folder=data_root / 'SEED_chunks'
+        chunk_size=args.chunk_size,
+        overlap=args.overlap,
+        save_folder=save_folder
     )
 
 
