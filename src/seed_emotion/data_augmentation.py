@@ -117,28 +117,27 @@ def _infer_sessions_from_filenames(mat_files: list[Path]) -> dict[Path, int]:
     return sessions
 
 
-def _compute_fixed_len(mat_files: list[Path], window_sizes: list[int], non_overlapping_rate: float) -> int:
+def _compute_fixed_len_for_file(file_path: Path, window_sizes: list[int], non_overlapping_rate: float) -> int:
     """
-    Compute a single fixed length to mimic the original SEED logic:
-    use one global truncation length across all files and window sizes.
+    Compute a per-file fixed length to mimic the original raw_codes logic:
+    for each file (session), use one fixed truncation length across all window sizes.
     """
-    global_min = None
-    for file_path in mat_files:
-        data = loadmat(str(file_path))
-        trial_list = _collect_trials(data)
-        for t in window_sizes:
-            step = int(math.ceil(t * non_overlapping_rate))
-            for trial in trial_list:
-                raw_data = data[trial]
-                n_samples = int(math.floor((raw_data.shape[1] - t) / step))
-                if n_samples < 1:
-                    n_samples = 1
-                concat_len = n_samples * t
-                if global_min is None or concat_len < global_min:
-                    global_min = concat_len
-    if global_min is None:
-        raise ValueError("无法计算固定长度，未找到有效 trial。")
-    return int(global_min)
+    data = loadmat(str(file_path))
+    trial_list = _collect_trials(data)
+    min_len = None
+    for t in window_sizes:
+        step = int(math.ceil(t * non_overlapping_rate))
+        for trial in trial_list:
+            raw_data = data[trial]
+            n_samples = int(math.floor((raw_data.shape[1] - t) / step))
+            if n_samples < 1:
+                n_samples = 1
+            concat_len = n_samples * t
+            if min_len is None or concat_len < min_len:
+                min_len = concat_len
+    if min_len is None:
+        raise ValueError(f"无法计算固定长度，未找到有效 trial: {file_path}")
+    return int(min_len)
 
 
 def augment_data(file_path, s_path, ws, ch=62, non_overlapping_rate=0.35, labels=None, output_stem=None, fixed_len=None):
@@ -275,15 +274,13 @@ def main():
         if labels.ndim == 2:
             session_map = _infer_sessions_from_filenames(mat_files)
 
-    fixed_len = None
-    if dataset == "seed-iv":
-        fixed_len = _compute_fixed_len(mat_files, window_sizes, non_overlapping_rate=0.35)
-        print(f"[SEED-IV] 计算得到全局固定长度 fixed_len={fixed_len}")
-
     for file_path in mat_files:
         if file_path.name.endswith(".txt"):
             continue
         session_id = session_map.get(file_path) if session_map is not None else None
+        fixed_len = _compute_fixed_len_for_file(file_path, window_sizes, non_overlapping_rate=0.35) if dataset == "seed-iv" else None
+        if dataset == "seed-iv":
+            print(f"[SEED-IV] {file_path.name} 计算得到固定长度 fixed_len={fixed_len}")
         labels = _labels_for_file(dataset, seed_root, file_path, session_id=session_id)
         augmented_labels = np.tile(labels, len(window_sizes))
         if file_path.parent == seed_root:

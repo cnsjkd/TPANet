@@ -7,3 +7,4 @@ attn_viz/models/
 attn_viz/
 attn_records/
 *.jsonl
+raw_codes/

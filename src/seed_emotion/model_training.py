@@ -30,8 +30,8 @@ from torch.utils.data import DataLoader, Dataset, TensorDataset
 from transformers import BertModel, BertTokenizer
 
 
-DEFAULT_DATA_DIR = "/home/aispeech/codes/zxy/SEED_chunks"
-DEFAULT_BERT_DIR = "/home/aispeech/codes/zxy/TPANet-main/TPANet-main2/models/bert-base-uncased"
+DEFAULT_DATA_DIR = "/home/xiaoying/SEED-IV_chunks"
+DEFAULT_BERT_DIR = "/home/xiaoying/TPANet-main2/models/bert-base-uncased"
 
 
 def _is_git_lfs_pointer(file_path: Path) -> bool:
@@ -148,7 +148,8 @@ class EEGDataset(Dataset):
             labels = np.array(labels, dtype=np.int64)
             if labels.size == 0:
                 raise ValueError(f"{file_path} 中 labels 为空。")
-            labels = labels - labels.min()
+            if labels.min() < 0:
+                labels = labels - labels.min()
             self.labels = labels
 
     def __len__(self):
@@ -197,7 +198,6 @@ class ReprogrammingLayer(nn.Module):
     def __init__(self, embed_dim, llm_embed_dim, num_heads=8, max_len=5000):
         super(ReprogrammingLayer, self).__init__()
         self.linear = nn.Linear(embed_dim, llm_embed_dim)
-        self.ln = nn.LayerNorm(llm_embed_dim)
         self.multihead_attn = nn.MultiheadAttention(embed_dim=llm_embed_dim, num_heads=num_heads, batch_first=True)
         self.positional_embedding = PositionalEmbedding(d_model=llm_embed_dim, max_len=max_len)
 
@@ -217,8 +217,6 @@ class ReprogrammingLayer(nn.Module):
 
         positional_encoding = self.positional_embedding(target_embedding)
         target_embedding = target_embedding + positional_encoding
-
-        target_embedding = self.ln(target_embedding)
 
         attn_output, attn_weights = self.multihead_attn(
             target_embedding, source_embedding, value_embedding,
@@ -594,9 +592,9 @@ def evaluate_model(
                         prompt_embeddings = prompt_cache_cpu[batch_idx].to(device).float()
                     else:
                         if prompt_inputs is None:
-                            prompt_inputs = tokenizer(
-                                prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=50
-                            )
+                        prompt_inputs = tokenizer(
+                            prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=50
+                        )
                         prompt_embeddings = bert_model(**prompt_inputs.to(device)).last_hidden_state
                 eeg_embeddings, attn_weights = reprogramming_layer(eeg_embeddings, prompt_embeddings, prompt_embeddings)
 
@@ -696,8 +694,8 @@ def main():
     ap.add_argument(
         "--batch_size",
         type=int,
-        default=int(os.getenv("TRAIN_BATCH_SIZE", "16")),
-        help="Training/evaluation batch size (default=16, lower to reduce OOM risk).",
+        default=int(os.getenv("TRAIN_BATCH_SIZE", "32")),
+        help="Training/evaluation batch size (default=32, lower to reduce OOM risk).",
     )
     ap.add_argument(
         "--cache_batch_size",
