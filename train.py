@@ -1,13 +1,9 @@
 """
   单 fold:：
-  python seed_iv_2026_like_de_LDS/train.py \
-    --root /path/to/eeg_raw_data \
-    --test_subject 1
+  python seed_iv_2026_like_de_LDS/train.py --test_subject 1
 
   完整 LOSO：
-  python seed_iv_2026_like_de_LDS/train.py \
-    --root /path/to/eeg_raw_data \
-    --loso
+  python seed_iv_2026_like_de_LDS/train.py --loso
 """
 
 from __future__ import annotations
@@ -229,7 +225,12 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SEED-IV raw EEG -> learnable DE-like + Conformer")
 
-    parser.add_argument("--root", type=str, required=True, help="Path to SEED-IV eeg_raw_data")
+    parser.add_argument(
+        "--root",
+        type=str,
+        default="/home/aispeech/codes/zxy/SEED-IV",
+        help="Path to SEED-IV eeg_raw_data",
+    )
     parser.add_argument("--sessions", type=int, nargs="+", default=[1, 2, 3], help="e.g. 1 2 3")
 
     parser.add_argument("--chunk_size", type=int, default=800, help="4s @ 200Hz = 800")
