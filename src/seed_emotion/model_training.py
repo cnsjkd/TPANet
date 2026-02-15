@@ -592,9 +592,9 @@ def evaluate_model(
                         prompt_embeddings = prompt_cache_cpu[batch_idx].to(device).float()
                     else:
                         if prompt_inputs is None:
-                        prompt_inputs = tokenizer(
-                            prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=50
-                        )
+                            prompt_inputs = tokenizer(
+                                prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=50
+                            )
                         prompt_embeddings = bert_model(**prompt_inputs.to(device)).last_hidden_state
                 eeg_embeddings, attn_weights = reprogramming_layer(eeg_embeddings, prompt_embeddings, prompt_embeddings)
 
