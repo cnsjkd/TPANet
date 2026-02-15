@@ -13,7 +13,7 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -40,6 +40,34 @@ def seed_everything(seed: int = 42) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = True
+
+
+def split_train_val_trial_keys(
+    sessions: Sequence[int],
+    train_subjects: Sequence[int],
+    val_split: float,
+    seed: int,
+) -> Tuple[List[Tuple[int, int, int]], List[Tuple[int, int, int]]]:
+    if val_split <= 0 or val_split >= 0.5:
+        raise ValueError("val_split must be in (0, 0.5)")
+
+    rng = random.Random(seed)
+    train_keys: List[Tuple[int, int, int]] = []
+    val_keys: List[Tuple[int, int, int]] = []
+
+    for session_id in sessions:
+        for subject_id in train_subjects:
+            trials = list(range(1, 25))
+            rng.shuffle(trials)
+            val_n = max(1, int(round(len(trials) * val_split)))
+            val_set = set(trials[:val_n])
+            for trial_id in range(1, 25):
+                key = (int(session_id), int(subject_id), int(trial_id))
+                if trial_id in val_set:
+                    val_keys.append(key)
+                else:
+                    train_keys.append(key)
+    return train_keys, val_keys
 
 
 @torch.no_grad()
@@ -77,6 +105,12 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
     train_subjects = [s for s in all_subjects if s != test_subject]
     if not train_subjects:
         raise ValueError("LOSO requires at least 2 subjects")
+    train_keys, val_keys = split_train_val_trial_keys(
+        sessions=args.sessions,
+        train_subjects=train_subjects,
+        val_split=args.val_split,
+        seed=args.seed + int(test_subject),
+    )
 
     fold_cache_dir = None
     if args.cache_dir:
@@ -87,10 +121,22 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
         root=args.root,
         sessions=args.sessions,
         subject_ids=train_subjects,
+        trial_filter=train_keys,
         chunk_size=args.chunk_size,
         num_channel=args.num_channel,
         cache_dir=fold_cache_dir,
-        per_channel_zscore=not args.no_zscore,
+        per_channel_zscore=(args.zscore and not args.no_zscore),
+        mat_cache_size=args.mat_cache_size,
+    )
+    val_set = SEEDIVRawTrialDataset(
+        root=args.root,
+        sessions=args.sessions,
+        subject_ids=train_subjects,
+        trial_filter=val_keys,
+        chunk_size=args.chunk_size,
+        num_channel=args.num_channel,
+        cache_dir=fold_cache_dir,
+        per_channel_zscore=(args.zscore and not args.no_zscore),
         mat_cache_size=args.mat_cache_size,
     )
     test_set = SEEDIVRawTrialDataset(
@@ -100,7 +146,7 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
         chunk_size=args.chunk_size,
         num_channel=args.num_channel,
         cache_dir=fold_cache_dir,
-        per_channel_zscore=not args.no_zscore,
+        per_channel_zscore=(args.zscore and not args.no_zscore),
         mat_cache_size=args.mat_cache_size,
     )
 
@@ -109,6 +155,15 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
         train_set,
         batch_size=args.batch_size,
         shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+        collate_fn=collate_trials,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=args.batch_size,
+        shuffle=False,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
         drop_last=False,
@@ -146,8 +201,10 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
     criterion = nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
 
-    best_test_acc = -1.0
+    best_val_acc = -1.0
     best_epoch = -1
+    best_state = None
+    patience = 0
 
     start_time = time.time()
     for epoch in range(1, args.epochs + 1):
@@ -183,40 +240,58 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
 
         train_loss = running_loss / max(running_count, 1)
         train_acc = running_correct / max(running_count, 1)
-        test_metrics = evaluate(model, test_loader, device)
-
-        test_acc = float(test_metrics["acc"])
-        if test_acc > best_test_acc:
-            best_test_acc = test_acc
+        val_metrics = evaluate(model, val_loader, device)
+        val_acc = float(val_metrics["acc"])
+        if val_acc > best_val_acc + args.early_stop_min_delta:
+            best_val_acc = val_acc
             best_epoch = epoch
+            patience = 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             if args.save_dir:
                 save_dir = Path(args.save_dir)
                 save_dir.mkdir(parents=True, exist_ok=True)
-                save_path = save_dir / f"seediv_e2e_conformer_testsub{test_subject:02d}.pt"
+                save_path = (
+                    save_dir
+                    / f"seediv_e2e_conformer_testsub{test_subject:02d}_epoch{epoch:03d}_val{val_acc:.4f}.pt"
+                )
                 torch.save(
                     {
                         "model": model.state_dict(),
                         "args": vars(args),
                         "test_subject": test_subject,
                         "best_epoch": best_epoch,
-                        "best_test_acc": best_test_acc,
+                        "best_val_acc": best_val_acc,
                     },
                     save_path,
                 )
+        else:
+            patience += 1
+            if patience >= args.early_stop_patience:
+                print("Early stop.")
+                break
 
         if epoch % args.log_every == 0 or epoch in (1, args.epochs):
             current_lr = optimizer.param_groups[0]["lr"]
             print(
                 f"[sub{test_subject:02d}] epoch {epoch:03d}/{args.epochs} "
                 f"lr={current_lr:.3e} train_loss={train_loss:.4f} train_acc={train_acc*100:.2f}% "
-                f"test_loss={test_metrics['loss']:.4f} test_acc={test_acc*100:.2f}% "
-                f"best={best_test_acc*100:.2f}%@{best_epoch}"
+                f"val_loss={val_metrics['loss']:.4f} val_acc={val_acc*100:.2f}% "
+                f"best_val={best_val_acc*100:.2f}%@{best_epoch}"
             )
 
+    if best_state is not None:
+        model.load_state_dict(best_state, strict=True)
+    test_metrics = evaluate(model, test_loader, device)
+    test_acc = float(test_metrics["acc"])
     elapsed = time.time() - start_time
+    print(
+        f"[sub{test_subject:02d}] final_test_loss={test_metrics['loss']:.4f} "
+        f"final_test_acc={test_acc*100:.2f}% (best_val={best_val_acc*100:.2f}%@{best_epoch})"
+    )
     return {
         "test_subject": float(test_subject),
-        "best_acc": float(best_test_acc),
+        "best_val_acc": float(best_val_acc),
+        "test_acc": float(test_acc),
         "best_epoch": float(best_epoch),
         "seconds": float(elapsed),
     }
@@ -255,10 +330,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--cache_dir", type=str, default=None)
     parser.add_argument("--mat_cache_size", type=int, default=8)
-    parser.add_argument("--no_zscore", action="store_true")
+    parser.add_argument("--zscore", action="store_true", help="Enable per-trial per-channel z-score (default off)")
+    parser.add_argument("--no_zscore", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--val_split", type=float, default=0.2)
+    parser.add_argument("--early_stop_patience", type=int, default=10)
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.001)
 
     parser.add_argument("--test_subject", type=int, default=1)
     parser.add_argument("--loso", action="store_true")
+    parser.add_argument("--start_fold", type=int, default=1)
 
     parser.add_argument("--save_dir", type=str, default=None)
     parser.add_argument("--results_csv", type=str, default=None)
@@ -305,7 +385,8 @@ def main() -> None:
             "fold",
             "test_subject",
             "best_epoch",
-            "best_test_acc",
+            "best_val_acc",
+            "test_acc",
             "seconds",
             "sessions",
             "chunk_size",
@@ -321,6 +402,8 @@ def main() -> None:
 
     fold_results: List[Dict[str, float]] = []
     for fold_idx, test_subject in enumerate(fold_subjects, start=1):
+        if fold_idx < args.start_fold:
+            continue
         print(f"\n=== Fold {fold_idx}/{len(fold_subjects)} | test_subject={test_subject:02d} ===")
         result = train_one_fold(args, test_subject=test_subject, device=device)
         fold_results.append(result)
@@ -331,7 +414,8 @@ def main() -> None:
                 fold_idx,
                 test_subject,
                 int(result["best_epoch"]),
-                f"{result['best_acc']:.4f}",
+                f"{result['best_val_acc']:.4f}",
+                f"{result['test_acc']:.4f}",
                 f"{result['seconds']:.1f}",
                 " ".join(str(s) for s in args.sessions),
                 args.chunk_size,
@@ -346,11 +430,11 @@ def main() -> None:
         )
 
     if args.loso:
-        accs = [r["best_acc"] for r in fold_results]
+        accs = [r["test_acc"] for r in fold_results]
         mean_acc = float(np.mean(accs)) if accs else 0.0
         std_acc = float(np.std(accs)) if accs else 0.0
         print("\nLOSO summary:")
-        print(f"mean_acc={mean_acc*100:.2f}% std={std_acc*100:.2f}%")
+        print(f"mean_test_acc={mean_acc*100:.2f}% std={std_acc*100:.2f}%")
 
 
 if __name__ == "__main__":

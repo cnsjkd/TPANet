@@ -15,6 +15,9 @@ eeg_raw_data/
 ```
 
 每个 session 目录下应有 15 个 `.mat`；每个 `.mat` 里应有 24 个 trial 键（`*_eeg1 ... *_eeg24`）。
+当前 `/home/aispeech/codes/zxy/SEED-IV` 已核对为：
+- 每个文件 24 个 trial（`*_eeg1..24`）
+- trial 数据维度第一维固定为 62（即 62 通道 EEG）
 
 数据检查脚本：
 
@@ -74,9 +77,19 @@ python seed_iv_2026_like_de_LDS/train.py \
 - `--root`：可选；默认 `/home/aispeech/codes/zxy/SEED-IV`
 - `--loso`：可选；加上后跑全部被试 LOSO
 - `--test_subject`：可选；不加 `--loso` 时生效，默认 `1`
+- `--val_split`：可选；从训练被试中划分验证集（默认 `0.2`）
+- `--early_stop_patience` / `--early_stop_min_delta`：可选；早停参数
+- `--start_fold`：可选；从指定 fold 开始跑（用于断点续跑）
+- `--zscore`：可选；默认关闭。打开后使用每个 trial 的按通道 z-score
 - 其余参数（`--epochs --batch_size --cache_dir --save_dir`）均为可选，代码有默认值或允许为空。
 
-## 5. 关键默认参数
+## 5. 评估协议（已修复数据泄露）
+- 采用 subject-wise LOSO：测试被试全程不参与训练。
+- 每个 fold 内仅用训练被试数据再划分 `train/val`（按 trial）。
+- 模型选择和早停只看 `val_acc`。
+- `test` 只在训练结束后评估一次，不参与选模。
+
+## 6. 关键默认参数
 - `--sessions 1 2 3`
 - `--chunk_size 800`（4s @ 200Hz）
 - `--num_channel 62`
@@ -90,12 +103,17 @@ python seed_iv_2026_like_de_LDS/train.py \
 - `--num_layers 6`
 - `--conformer_conv_kernel 15`
 - `--smoother_layers 2`
+- `--val_split 0.2`
+- `--early_stop_patience 10`
+- `--early_stop_min_delta 0.001`
+- 默认不做 z-score（与 `seed_iv_2026` 的 `norm_type=none` 对齐）
 
-## 6. 输出
-- checkpoint（若设置 `--save_dir`）：`seediv_e2e_conformer_testsubXX.pt`
+## 7. 输出
+- checkpoint（若设置 `--save_dir`）：`seediv_e2e_conformer_testsubXX_epochEEE_valVVVV.pt`
 - 结果 CSV（默认）：`TPANet-main/results_seed_iv_2026_like_de_lds.csv`
+- CSV 关键字段：`best_val_acc`, `test_acc`, `best_epoch`
 
-## 7. 代码结构
+## 8. 代码结构
 - `dataset.py`：读取 raw `.mat`、trial 切窗、变长 batch 对齐
 - `model.py`：可学习 DE-like 前端 + Conformer 分类器
 - `train.py`：单折/LOSO 训练与记录

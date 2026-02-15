@@ -4,7 +4,7 @@ import re
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Deque, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import torch
@@ -108,10 +108,6 @@ def _align_trial_shape(trial: np.ndarray, num_channel: int) -> np.ndarray:
         out = arr
     elif arr.shape[1] == num_channel:
         out = arr.T
-    elif arr.shape[0] > num_channel and arr.shape[1] != num_channel:
-        out = arr[:num_channel, :]
-    elif arr.shape[1] > num_channel and arr.shape[0] != num_channel:
-        out = arr.T[:num_channel, :]
     else:
         raise ValueError(f"cannot align trial shape {arr.shape} to channels={num_channel}")
 
@@ -132,6 +128,7 @@ class SEEDIVRawTrialDataset(Dataset):
         root: str | Path,
         sessions: Sequence[int] = (1, 2, 3),
         subject_ids: Optional[Sequence[int]] = None,
+        trial_filter: Optional[Sequence[Tuple[int, int, int]]] = None,
         chunk_size: int = 800,
         num_channel: int = 62,
         cache_dir: Optional[str | Path] = None,
@@ -141,6 +138,9 @@ class SEEDIVRawTrialDataset(Dataset):
         self.root = Path(root)
         self.sessions = [int(s) for s in sessions]
         self.subject_ids = set(subject_ids) if subject_ids is not None else None
+        self.trial_filter: Optional[Set[Tuple[int, int, int]]] = (
+            set((int(s), int(sub), int(t)) for s, sub, t in trial_filter) if trial_filter is not None else None
+        )
         self.chunk_size = int(chunk_size)
         self.num_channel = int(num_channel)
         self.cache_dir = Path(cache_dir) if cache_dir else None
@@ -183,27 +183,48 @@ class SEEDIVRawTrialDataset(Dataset):
                 samples = _load_mat(str(mat_path))
                 trial_keys = _extract_trial_keys(samples)
                 session_labels = LABELS_SEED4[session_id - 1]
-
+                trial_map: Dict[int, str] = {}
                 for trial_key, trial_id in trial_keys:
                     if 1 <= trial_id <= 24:
-                        self.index.append(
-                            TrialIndex(
-                                file_path=str(mat_path),
-                                session_id=session_id,
-                                subject_id=subject_id,
-                                date=date,
-                                trial_key=trial_key,
-                                trial_id=trial_id,
-                                label=int(session_labels[trial_id - 1]),
-                            )
+                        if trial_id in trial_map:
+                            raise ValueError(f"duplicate trial id={trial_id} in {mat_path}")
+                        trial_map[trial_id] = trial_key
+
+                expected_trials = set(range(1, 25))
+                if set(trial_map.keys()) != expected_trials:
+                    raise ValueError(
+                        f"{mat_path} trial keys mismatch: got {sorted(trial_map.keys())}, expected 1..24"
+                    )
+
+                for trial_id in range(1, 25):
+                    key = (session_id, subject_id, trial_id)
+                    if self.trial_filter is not None and key not in self.trial_filter:
+                        continue
+                    self.index.append(
+                        TrialIndex(
+                            file_path=str(mat_path),
+                            session_id=session_id,
+                            subject_id=subject_id,
+                            date=date,
+                            trial_key=trial_map[trial_id],
+                            trial_id=trial_id,
+                            label=int(session_labels[trial_id - 1]),
                         )
+                    )
 
     def __len__(self) -> int:
         return len(self.index)
 
     def _cache_path(self, ti: TrialIndex) -> Path:
         assert self.cache_dir is not None
-        return self.cache_dir / f"s{ti.session_id}_sub{ti.subject_id}_{ti.date}_trial{ti.trial_id}.npz"
+        z_flag = 1 if self.per_channel_zscore else 0
+        return (
+            self.cache_dir
+            / (
+                f"s{ti.session_id}_sub{ti.subject_id}_{ti.date}_trial{ti.trial_id}_"
+                f"w{self.chunk_size}_c{self.num_channel}_z{z_flag}.npz"
+            )
+        )
 
     def _load_trial_mat(self, file_path: str) -> Dict[str, np.ndarray]:
         if file_path in self._mat_cache:
