@@ -1,3 +1,15 @@
+"""
+  单 fold:：
+  python seed_iv_2026_like_de_LDS/train.py \
+    --root /path/to/eeg_raw_data \
+    --test_subject 1
+
+  完整 LOSO：
+  python seed_iv_2026_like_de_LDS/train.py \
+    --root /path/to/eeg_raw_data \
+    --loso
+"""
+
 from __future__ import annotations
 
 import argparse
