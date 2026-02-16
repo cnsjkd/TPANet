@@ -1,9 +1,9 @@
 """
   单 fold:：
-  python seed_iv_2026_like_de_LDS/train.py --test_subject 1
+  python /home/aispeech/codes/zxy/TPANet-main/seed_iv_2026_like_de_LDS/train.py --test_subject 1
 
   完整 LOSO：
-  python seed_iv_2026_like_de_LDS/train.py --loso
+  python /home/aispeech/codes/zxy/TPANet-main/seed_iv_2026_like_de_LDS/train.py --loso
 """
 
 from __future__ import annotations
