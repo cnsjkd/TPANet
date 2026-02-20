@@ -4,11 +4,17 @@
 
   完整 LOSO：
   python /home/aispeech/codes/zxy/TPANet-main/seed_iv_2026_like_de_LDS/train.py --loso
+==============================
+  1. 主方案（默认，离线常用）
+     python /home/aispeech/codes/zxy/TPANet-main/seed_iv_2026_like_de_LDS/train.py --loso
+  2. 严格版
+     python /home/aispeech/codes/zxy/TPANet-main/seed_iv_2026_like_de_LDS/train.py --loso --strict_norm
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import random
 import sys
 import time
@@ -33,6 +39,10 @@ except ImportError:  # pragma: no cover
     from seed_iv_2026_like_de_LDS.logger import CSVLogger  # type: ignore
     from seed_iv_2026_like_de_LDS.model import EEGConformerClassifier  # type: ignore
 
+NORM_NONE = "none"
+NORM_TRIAL_ZSCORE = "trial_zscore"
+NORM_TRAIN_SET_ZSCORE = "train_set_zscore"
+
 
 def seed_everything(seed: int = 42) -> None:
     random.seed(seed)
@@ -42,32 +52,54 @@ def seed_everything(seed: int = 42) -> None:
     torch.backends.cudnn.benchmark = True
 
 
-def split_train_val_trial_keys(
-    sessions: Sequence[int],
+def split_train_val_subjects(
     train_subjects: Sequence[int],
     val_split: float,
     seed: int,
-) -> Tuple[List[Tuple[int, int, int]], List[Tuple[int, int, int]]]:
+) -> Tuple[List[int], List[int]]:
     if val_split <= 0 or val_split >= 0.5:
         raise ValueError("val_split must be in (0, 0.5)")
+    if len(train_subjects) < 2:
+        raise ValueError("subject-wise split requires at least 2 train subjects")
 
     rng = random.Random(seed)
-    train_keys: List[Tuple[int, int, int]] = []
-    val_keys: List[Tuple[int, int, int]] = []
+    subjects = [int(s) for s in train_subjects]
+    rng.shuffle(subjects)
+    val_n = max(1, int(round(len(subjects) * val_split)))
+    val_n = min(val_n, len(subjects) - 1)
+    val_subjects = sorted(subjects[:val_n])
+    train_subjects_fold = sorted(subjects[val_n:])
+    return train_subjects_fold, val_subjects
 
+
+def build_trial_keys(sessions: Sequence[int], subjects: Sequence[int]) -> List[Tuple[int, int, int]]:
+    keys: List[Tuple[int, int, int]] = []
     for session_id in sessions:
-        for subject_id in train_subjects:
-            trials = list(range(1, 25))
-            rng.shuffle(trials)
-            val_n = max(1, int(round(len(trials) * val_split)))
-            val_set = set(trials[:val_n])
+        for subject_id in subjects:
             for trial_id in range(1, 25):
-                key = (int(session_id), int(subject_id), int(trial_id))
-                if trial_id in val_set:
-                    val_keys.append(key)
-                else:
-                    train_keys.append(key)
-    return train_keys, val_keys
+                keys.append((int(session_id), int(subject_id), int(trial_id)))
+    return keys
+
+
+def estimate_channel_stats(dataset: SEEDIVRawTrialDataset, num_channel: int) -> Tuple[np.ndarray, np.ndarray]:
+    channel_sum = np.zeros((num_channel,), dtype=np.float64)
+    channel_sq_sum = np.zeros((num_channel,), dtype=np.float64)
+    sample_count = 0
+
+    for idx in range(len(dataset)):
+        x, _, _ = dataset[idx]
+        arr = x.numpy().astype(np.float64, copy=False)
+        channel_sum += arr.sum(axis=(0, 2))
+        channel_sq_sum += (arr * arr).sum(axis=(0, 2))
+        sample_count += int(arr.shape[0] * arr.shape[2])
+
+    if sample_count <= 0:
+        raise RuntimeError("failed to estimate channel stats: empty dataset")
+
+    mean = channel_sum / sample_count
+    var = np.maximum(channel_sq_sum / sample_count - mean * mean, 1e-12)
+    std = np.sqrt(var)
+    return mean.astype(np.float32), std.astype(np.float32)
 
 
 @torch.no_grad()
@@ -102,20 +134,52 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
     if test_subject not in all_subjects:
         raise ValueError(f"test_subject {test_subject} not found in common subjects: {all_subjects}")
 
-    train_subjects = [s for s in all_subjects if s != test_subject]
-    if not train_subjects:
+    train_subjects_all = [s for s in all_subjects if s != test_subject]
+    if not train_subjects_all:
         raise ValueError("LOSO requires at least 2 subjects")
-    train_keys, val_keys = split_train_val_trial_keys(
-        sessions=args.sessions,
-        train_subjects=train_subjects,
+    train_subjects, val_subjects = split_train_val_subjects(
+        train_subjects=train_subjects_all,
         val_split=args.val_split,
         seed=args.seed + int(test_subject),
     )
+    train_keys = build_trial_keys(args.sessions, train_subjects)
+    val_keys = build_trial_keys(args.sessions, val_subjects)
 
     fold_cache_dir = None
     if args.cache_dir:
         fold_cache_dir = Path(args.cache_dir) / f"fold_testsub{test_subject:02d}"
         fold_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    per_trial_zscore = args.norm_mode == NORM_TRIAL_ZSCORE
+    channel_mean = None
+    channel_std = None
+    normalization_tag = args.norm_mode
+    if args.norm_mode == NORM_TRAIN_SET_ZSCORE:
+        stats_source = SEEDIVRawTrialDataset(
+            root=args.root,
+            sessions=args.sessions,
+            subject_ids=train_subjects,
+            trial_filter=train_keys,
+            chunk_size=args.chunk_size,
+            num_channel=args.num_channel,
+            cache_dir=None,
+            per_channel_zscore=False,
+            mat_cache_size=args.mat_cache_size,
+            normalization_tag="stats_raw",
+        )
+        channel_mean, channel_std = estimate_channel_stats(stats_source, args.num_channel)
+        digest = hashlib.sha1(np.concatenate([channel_mean, channel_std]).tobytes()).hexdigest()[:8]
+        normalization_tag = f"trainz_{digest}"
+
+    print(
+        f"[sub{test_subject:02d}] train_subjects={train_subjects} "
+        f"val_subjects={val_subjects} norm_mode={args.norm_mode}"
+    )
+    if channel_mean is not None and channel_std is not None:
+        print(
+            f"[sub{test_subject:02d}] train_norm_stats "
+            f"mean={float(channel_mean.mean()):.4f} std={float(channel_std.mean()):.4f}"
+        )
 
     train_set = SEEDIVRawTrialDataset(
         root=args.root,
@@ -125,19 +189,25 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
         chunk_size=args.chunk_size,
         num_channel=args.num_channel,
         cache_dir=fold_cache_dir,
-        per_channel_zscore=(args.zscore and not args.no_zscore),
+        per_channel_zscore=per_trial_zscore,
         mat_cache_size=args.mat_cache_size,
+        channel_mean=channel_mean,
+        channel_std=channel_std,
+        normalization_tag=normalization_tag,
     )
     val_set = SEEDIVRawTrialDataset(
         root=args.root,
         sessions=args.sessions,
-        subject_ids=train_subjects,
+        subject_ids=val_subjects,
         trial_filter=val_keys,
         chunk_size=args.chunk_size,
         num_channel=args.num_channel,
         cache_dir=fold_cache_dir,
-        per_channel_zscore=(args.zscore and not args.no_zscore),
+        per_channel_zscore=per_trial_zscore,
         mat_cache_size=args.mat_cache_size,
+        channel_mean=channel_mean,
+        channel_std=channel_std,
+        normalization_tag=normalization_tag,
     )
     test_set = SEEDIVRawTrialDataset(
         root=args.root,
@@ -146,8 +216,11 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
         chunk_size=args.chunk_size,
         num_channel=args.num_channel,
         cache_dir=fold_cache_dir,
-        per_channel_zscore=(args.zscore and not args.no_zscore),
+        per_channel_zscore=per_trial_zscore,
         mat_cache_size=args.mat_cache_size,
+        channel_mean=channel_mean,
+        channel_std=channel_std,
+        normalization_tag=normalization_tag,
     )
 
     pin_memory = device.type == "cuda"
@@ -155,6 +228,15 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
         train_set,
         batch_size=args.batch_size,
         shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+        collate_fn=collate_trials,
+    )
+    train_eval_loader = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=False,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
         drop_last=False,
@@ -211,7 +293,6 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
         model.train()
 
         running_loss = 0.0
-        running_correct = 0
         running_count = 0
 
         for x, lengths, y, _ in train_loader:
@@ -232,14 +313,14 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
             scaler.update()
 
             running_loss += float(loss.item()) * y.size(0)
-            running_correct += int((logits.detach().argmax(dim=-1) == y).sum().item())
             running_count += int(y.size(0))
 
         if scheduler is not None:
             scheduler.step()
 
-        train_loss = running_loss / max(running_count, 1)
-        train_acc = running_correct / max(running_count, 1)
+        train_loss_step = running_loss / max(running_count, 1)
+        train_metrics = evaluate(model, train_eval_loader, device)
+        train_acc = float(train_metrics["acc"])
         val_metrics = evaluate(model, val_loader, device)
         val_acc = float(val_metrics["acc"])
         if val_acc > best_val_acc + args.early_stop_min_delta:
@@ -274,7 +355,8 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
             current_lr = optimizer.param_groups[0]["lr"]
             print(
                 f"[sub{test_subject:02d}] epoch {epoch:03d}/{args.epochs} "
-                f"lr={current_lr:.3e} train_loss={train_loss:.4f} train_acc={train_acc*100:.2f}% "
+                f"lr={current_lr:.3e} train_loss(step)={train_loss_step:.4f} "
+                f"train_loss(eval)={train_metrics['loss']:.4f} train_acc={train_acc*100:.2f}% "
                 f"val_loss={val_metrics['loss']:.4f} val_acc={val_acc*100:.2f}% "
                 f"best_val={best_val_acc*100:.2f}%@{best_epoch}"
             )
@@ -330,8 +412,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--cache_dir", type=str, default=None)
     parser.add_argument("--mat_cache_size", type=int, default=8)
-    parser.add_argument("--zscore", action="store_true", help="Enable per-trial per-channel z-score (default off)")
-    parser.add_argument("--no_zscore", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--norm_mode",
+        type=str,
+        choices=[NORM_TRIAL_ZSCORE, NORM_TRAIN_SET_ZSCORE, NORM_NONE],
+        default=NORM_TRIAL_ZSCORE,
+        help="Normalization mode: per-trial z-score (default), strict train-set stats, or none",
+    )
+    parser.add_argument(
+        "--strict_norm",
+        action="store_true",
+        help=f"Alias of --norm_mode {NORM_TRAIN_SET_ZSCORE}",
+    )
+    parser.add_argument("--zscore", action="store_true", help=f"Legacy alias of --norm_mode {NORM_TRIAL_ZSCORE}")
+    parser.add_argument("--no_zscore", action="store_true", help=f"Legacy alias of --norm_mode {NORM_NONE}")
     parser.add_argument("--val_split", type=float, default=0.2)
     parser.add_argument("--early_stop_patience", type=int, default=10)
     parser.add_argument("--early_stop_min_delta", type=float, default=0.001)
@@ -346,7 +440,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    legacy_flags = int(args.strict_norm) + int(args.zscore) + int(args.no_zscore)
+    if legacy_flags > 1:
+        parser.error("--strict_norm, --zscore and --no_zscore are mutually exclusive")
+    if args.strict_norm:
+        args.norm_mode = NORM_TRAIN_SET_ZSCORE
+    elif args.zscore:
+        args.norm_mode = NORM_TRIAL_ZSCORE
+    elif args.no_zscore:
+        args.norm_mode = NORM_NONE
+    return args
 
 
 def main() -> None:
@@ -357,6 +461,7 @@ def main() -> None:
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
     print(f"Device: {device}")
     print(f"Sessions: {args.sessions}")
+    print(f"Norm mode: {args.norm_mode}")
 
     root = Path(args.root).expanduser().resolve()
     if not root.exists():

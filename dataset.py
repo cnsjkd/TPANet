@@ -134,6 +134,9 @@ class SEEDIVRawTrialDataset(Dataset):
         cache_dir: Optional[str | Path] = None,
         per_channel_zscore: bool = True,
         mat_cache_size: int = 8,
+        channel_mean: Optional[np.ndarray] = None,
+        channel_std: Optional[np.ndarray] = None,
+        normalization_tag: Optional[str] = None,
     ) -> None:
         self.root = Path(root)
         self.sessions = [int(s) for s in sessions]
@@ -146,11 +149,35 @@ class SEEDIVRawTrialDataset(Dataset):
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.per_channel_zscore = bool(per_channel_zscore)
         self.mat_cache_size = int(mat_cache_size)
+        self.channel_mean: Optional[np.ndarray] = None
+        self.channel_std: Optional[np.ndarray] = None
 
         if self.chunk_size <= 0:
             raise ValueError("chunk_size must be > 0")
         if self.num_channel <= 0:
             raise ValueError("num_channel must be > 0")
+        if self.per_channel_zscore and (channel_mean is not None or channel_std is not None):
+            raise ValueError("per_channel_zscore and channel_mean/channel_std are mutually exclusive")
+        if (channel_mean is None) != (channel_std is None):
+            raise ValueError("channel_mean and channel_std must be both set or both None")
+        if channel_mean is not None and channel_std is not None:
+            mean = np.asarray(channel_mean, dtype=np.float32).reshape(-1)
+            std = np.asarray(channel_std, dtype=np.float32).reshape(-1)
+            if mean.shape[0] != self.num_channel or std.shape[0] != self.num_channel:
+                raise ValueError(
+                    f"channel_mean/std shape mismatch: got {mean.shape[0]}/{std.shape[0]}, "
+                    f"expected {self.num_channel}"
+                )
+            self.channel_mean = mean
+            self.channel_std = std
+        if normalization_tag is None:
+            if self.per_channel_zscore:
+                normalization_tag = "trialz"
+            elif self.channel_mean is not None:
+                normalization_tag = "trainz"
+            else:
+                normalization_tag = "none"
+        self.normalization_tag = re.sub(r"[^0-9A-Za-z_.-]+", "-", str(normalization_tag))[:40] or "none"
 
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -217,12 +244,11 @@ class SEEDIVRawTrialDataset(Dataset):
 
     def _cache_path(self, ti: TrialIndex) -> Path:
         assert self.cache_dir is not None
-        z_flag = 1 if self.per_channel_zscore else 0
         return (
             self.cache_dir
             / (
                 f"s{ti.session_id}_sub{ti.subject_id}_{ti.date}_trial{ti.trial_id}_"
-                f"w{self.chunk_size}_c{self.num_channel}_z{z_flag}.npz"
+                f"w{self.chunk_size}_c{self.num_channel}_norm{self.normalization_tag}.npz"
             )
         )
 
@@ -274,6 +300,10 @@ class SEEDIVRawTrialDataset(Dataset):
         if self.per_channel_zscore:
             mean = x.mean(axis=(0, 2), keepdims=True)
             std = x.std(axis=(0, 2), keepdims=True)
+            x = (x - mean) / (std + 1e-6)
+        elif self.channel_mean is not None and self.channel_std is not None:
+            mean = self.channel_mean[None, :, None]
+            std = self.channel_std[None, :, None]
             x = (x - mean) / (std + 1e-6)
 
         x = x.astype(np.float32, copy=False)
