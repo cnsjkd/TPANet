@@ -73,30 +73,21 @@ python seed_iv_2026_like_de_LDS/train.py \
   --save_dir ./ckpt
 ```
 
-严格版归一化（仅用训练集统计量）：
-
-```bash
-python seed_iv_2026_like_de_LDS/train.py \
-  --root /path/to/eeg_raw_data \
-  --loso \
-  --norm_mode train_set_zscore
-```
-
 ## 4. 参数说明（哪些必须）
 - `--root`：可选；默认 `/home/aispeech/codes/zxy/SEED-IV`
 - `--loso`：可选；加上后跑全部被试 LOSO
 - `--test_subject`：可选；不加 `--loso` 时生效，默认 `1`
-- `--val_split`：可选；从训练被试中按被试比例划分验证集（默认 `0.2`）
+- `--val_split`：可选；从训练被试中划分验证集（默认 `0.2`）
 - `--early_stop_patience` / `--early_stop_min_delta`：可选；早停参数
 - `--start_fold`：可选；从指定 fold 开始跑（用于断点续跑）
-- `--norm_mode`：可选；`trial_zscore`（默认）/ `train_set_zscore`（严格版）/ `none`
-- `--strict_norm`：可选；等价于 `--norm_mode train_set_zscore`
-- `--zscore` / `--no_zscore`：兼容旧参数，分别等价于 `trial_zscore` / `none`
+- `--zscore`：可选；默认关闭。打开后使用每个 trial 的按通道 z-score
+- `--report_flops`：可选；开启后用 dummy input 估算一次 forward FLOPs（基于 `torch.profiler`）
+- `--flops_windows` / `--flops_batch_size`：可选；控制 FLOPs 估算时 dummy 输入形状
 - 其余参数（`--epochs --batch_size --cache_dir --save_dir`）均为可选，代码有默认值或允许为空。
 
 ## 5. 评估协议（已修复数据泄露）
 - 采用 subject-wise LOSO：测试被试全程不参与训练。
-- 每个 fold 内仅用训练被试数据再划分 `train/val`（按 subject）。
+- 每个 fold 内仅用训练被试数据再划分 `train/val`（按 trial）。
 - 模型选择和早停只看 `val_acc`。
 - `test` 只在训练结束后评估一次，不参与选模。
 
@@ -117,12 +108,13 @@ python seed_iv_2026_like_de_LDS/train.py \
 - `--val_split 0.2`
 - `--early_stop_patience 10`
 - `--early_stop_min_delta 0.001`
-- `--norm_mode trial_zscore`（默认）
+- 默认不做 z-score（与 `seed_iv_2026` 的 `norm_type=none` 对齐）
 
 ## 7. 输出
 - checkpoint（若设置 `--save_dir`）：`seediv_e2e_conformer_testsubXX_epochEEE_valVVVV.pt`
 - 结果 CSV（默认）：`TPANet-main/results_seed_iv_2026_like_de_lds.csv`
-- CSV 关键字段：`best_val_acc`, `test_acc`, `best_epoch`
+- CSV 关键字段：`best_val_acc`, `test_acc`, `best_epoch`, `seconds`
+- 额外记录：`total_params`, `trainable_params`, `forward_gflops`, `flops_windows`, `flops_batch_size`
 
 ## 8. 代码结构
 - `dataset.py`：读取 raw `.mat`、trial 切窗、变长 batch 对齐
