@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Sequence, Set, Tuple
@@ -21,11 +21,9 @@ except Exception:
     h5py = None
 
 
-LABELS_SEED4 = [
-    [1, 2, 3, 0, 2, 0, 0, 1, 0, 1, 2, 1, 1, 1, 2, 3, 2, 2, 3, 3, 0, 3, 0, 3],
-    [2, 1, 3, 0, 0, 2, 0, 2, 3, 3, 2, 3, 2, 0, 1, 1, 2, 1, 0, 3, 0, 1, 3, 1],
-    [1, 2, 2, 1, 3, 3, 3, 1, 1, 2, 1, 0, 2, 3, 3, 0, 2, 3, 0, 0, 2, 0, 1, 0],
-]
+NUM_SEED_SESSIONS = 3
+NUM_SEED_TRIALS = 15
+SEED_LABEL_MAP = {-1: 0, 0: 1, 1: 2}
 
 
 @dataclass(frozen=True)
@@ -46,11 +44,46 @@ def parse_subject_id(mat_path: Path) -> int:
         raise ValueError(f"invalid subject id in filename: {mat_path.name}") from exc
 
 
+def parse_subject_date(mat_path: Path) -> str:
+    parts = mat_path.stem.split("_", 1)
+    if len(parts) < 2 or not parts[1]:
+        raise ValueError(f"invalid SEED file naming (missing date): {mat_path.name}")
+    return parts[1]
+
+
+def _scan_seed_session_files(data_root: Path) -> Dict[int, Dict[int, Path]]:
+    root = Path(data_root)
+    mat_files = sorted(p for p in root.glob("*.mat") if p.name != "label.mat")
+    if not mat_files:
+        raise FileNotFoundError(f"no .mat files found in {root}")
+
+    grouped: Dict[int, List[Tuple[str, Path]]] = defaultdict(list)
+    for mat_path in mat_files:
+        subject_id = parse_subject_id(mat_path)
+        date = parse_subject_date(mat_path)
+        grouped[subject_id].append((date, mat_path))
+
+    session_to_subject_files: Dict[int, Dict[int, Path]] = {sid: {} for sid in range(1, NUM_SEED_SESSIONS + 1)}
+    for subject_id, date_files in sorted(grouped.items()):
+        if len(date_files) != NUM_SEED_SESSIONS:
+            raise ValueError(
+                f"subject {subject_id} should have exactly {NUM_SEED_SESSIONS} files, got {len(date_files)}"
+            )
+        date_files_sorted = sorted(date_files, key=lambda x: x[0])
+        for session_id, (_, mat_path) in enumerate(date_files_sorted, start=1):
+            session_to_subject_files[session_id][subject_id] = mat_path
+
+    return session_to_subject_files
+
+
 def list_subject_ids(data_root: Path, session_id: int) -> List[int]:
-    session_dir = Path(data_root) / str(session_id)
-    subject_ids = sorted({parse_subject_id(p) for p in session_dir.glob("*.mat")})
+    session_id = int(session_id)
+    if session_id < 1 or session_id > NUM_SEED_SESSIONS:
+        raise ValueError(f"SEED session_id must be in [1, {NUM_SEED_SESSIONS}], got {session_id}")
+    session_to_subject_files = _scan_seed_session_files(Path(data_root))
+    subject_ids = sorted(session_to_subject_files[session_id].keys())
     if not subject_ids:
-        raise FileNotFoundError(f"no .mat files found in {session_dir}")
+        raise FileNotFoundError(f"no subject files found for session {session_id} under {data_root}")
     return subject_ids
 
 
@@ -90,7 +123,7 @@ def _extract_trial_keys(samples: Dict[str, np.ndarray]) -> List[Tuple[str, int]]
             continue
         if "eeg" not in key:
             continue
-        matched = re.findall(r".*_eeg(\d+)", key)
+        matched = re.findall(r".*_eeg(\d+)$", key)
         if not matched:
             continue
         trial_name_ids.append((key, int(matched[0])))
@@ -114,12 +147,34 @@ def _align_trial_shape(trial: np.ndarray, num_channel: int) -> np.ndarray:
     return out.astype(np.float32, copy=False)
 
 
+def _load_seed_labels(data_root: Path) -> List[int]:
+    label_path = Path(data_root) / "label.mat"
+    if not label_path.exists():
+        raise FileNotFoundError(f"missing SEED label file: {label_path}")
+
+    samples = _load_mat(str(label_path))
+    if "label" not in samples:
+        raise KeyError(f"'label' not found in {label_path}")
+
+    labels_raw = np.asarray(samples["label"]).reshape(-1)
+    if labels_raw.size != NUM_SEED_TRIALS:
+        raise ValueError(f"{label_path} should contain {NUM_SEED_TRIALS} labels, got {labels_raw.size}")
+
+    labels: List[int] = []
+    for v in labels_raw.tolist():
+        iv = int(v)
+        if iv not in SEED_LABEL_MAP:
+            raise ValueError(f"unexpected SEED label value {iv}, expected one of {sorted(SEED_LABEL_MAP.keys())}")
+        labels.append(SEED_LABEL_MAP[iv])
+    return labels
+
+
 class SEEDIVRawTrialDataset(Dataset):
     """One item = one trial with variable number of non-overlap windows.
 
     Returned sample:
     - x: (W, C, T) where W is number of windows, C=num_channel, T=chunk_size
-    - y: int label in [0,3]
+    - y: int label in [0,2]
     - meta: TrialIndex
     """
 
@@ -191,51 +246,49 @@ class SEEDIVRawTrialDataset(Dataset):
             raise RuntimeError("no trials found; check --root and file naming")
 
     def _build_index(self) -> None:
+        session_to_subject_files = _scan_seed_session_files(self.root)
+        labels = _load_seed_labels(self.root)
+
         for session_id in self.sessions:
-            session_dir = self.root / str(session_id)
-            if not session_dir.exists():
-                raise FileNotFoundError(f"missing session folder: {session_dir}")
+            sid = int(session_id)
+            if sid < 1 or sid > NUM_SEED_SESSIONS:
+                raise ValueError(f"SEED session id must be in [1, {NUM_SEED_SESSIONS}], got {sid}")
 
-            for mat_path in sorted(session_dir.glob("*.mat")):
-                try:
-                    subject_id = parse_subject_id(mat_path)
-                except ValueError:
-                    continue
-
+            subject_files = session_to_subject_files[sid]
+            for subject_id, mat_path in sorted(subject_files.items()):
                 if self.subject_ids is not None and subject_id not in self.subject_ids:
                     continue
 
-                name_parts = mat_path.stem.split("_")
-                date = name_parts[1] if len(name_parts) > 1 else "unknown"
+                date = parse_subject_date(mat_path)
                 samples = _load_mat(str(mat_path))
                 trial_keys = _extract_trial_keys(samples)
-                session_labels = LABELS_SEED4[session_id - 1]
                 trial_map: Dict[int, str] = {}
                 for trial_key, trial_id in trial_keys:
-                    if 1 <= trial_id <= 24:
+                    if 1 <= trial_id <= NUM_SEED_TRIALS:
                         if trial_id in trial_map:
                             raise ValueError(f"duplicate trial id={trial_id} in {mat_path}")
                         trial_map[trial_id] = trial_key
 
-                expected_trials = set(range(1, 25))
+                expected_trials = set(range(1, NUM_SEED_TRIALS + 1))
                 if set(trial_map.keys()) != expected_trials:
                     raise ValueError(
-                        f"{mat_path} trial keys mismatch: got {sorted(trial_map.keys())}, expected 1..24"
+                        f"{mat_path} trial keys mismatch: got {sorted(trial_map.keys())}, "
+                        f"expected 1..{NUM_SEED_TRIALS}"
                     )
 
-                for trial_id in range(1, 25):
-                    key = (session_id, subject_id, trial_id)
+                for trial_id in range(1, NUM_SEED_TRIALS + 1):
+                    key = (sid, subject_id, trial_id)
                     if self.trial_filter is not None and key not in self.trial_filter:
                         continue
                     self.index.append(
                         TrialIndex(
                             file_path=str(mat_path),
-                            session_id=session_id,
+                            session_id=sid,
                             subject_id=subject_id,
                             date=date,
                             trial_key=trial_map[trial_id],
                             trial_id=trial_id,
-                            label=int(session_labels[trial_id - 1]),
+                            label=int(labels[trial_id - 1]),
                         )
                     )
 

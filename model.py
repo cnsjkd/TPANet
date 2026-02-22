@@ -185,7 +185,7 @@ class LearnableDELDSLikeFrontend(nn.Module):
 class EEGConformerClassifier(nn.Module):
     def __init__(
         self,
-        num_classes: int = 4,
+        num_classes: int = 3,
         channels: int = 62,
         bands: int = 5,
         d_model: int = 256,

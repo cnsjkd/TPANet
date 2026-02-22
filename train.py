@@ -1,17 +1,17 @@
 """
   单 fold:：
-  python /home/aispeech/codes/zxy/TPANet-main/seed_iv_2026_like_de_LDS/train.py --test_subject 1
+  python /home/aispeech/codes/zxy/TPANet-main/seed_2026_like_de_LDS/train.py --test_subject 1
 
   完整 LOSO：
-  python /home/aispeech/codes/zxy/TPANet-main/seed_iv_2026_like_de_LDS/train.py --loso
+  python /home/aispeech/codes/zxy/TPANet-main/seed_2026_like_de_LDS/train.py --loso
 ==================
-python /home/aispeech/codes/zxy/TPANet-main/seed_iv_2026_like_de_LDS/train.py \
+python /home/aispeech/codes/zxy/TPANet-main/seed_2026_like_de_LDS/train.py \
     --loso \
-    --save_dir /home/aispeech/codes/zxy/TPANet-main/ckpt_seed_iv_2026_like_de_LDS \
+    --save_dir /home/aispeech/codes/zxy/TPANet-main/ckpt_seed_2026_like_de_LDS \
     --report_flops \
     --flops_windows 8 \
     --flops_batch_size 1 \
-    --results_csv /home/aispeech/codes/zxy/TPANet-main/results_seed_iv_2026_like_de_lds_new.csv
+    --results_csv /home/aispeech/codes/zxy/TPANet-main/results_seed_2026_like_de_lds_new.csv
 """
 
 from __future__ import annotations
@@ -33,13 +33,22 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(module_dir.parent))
 
 try:
-    from .dataset import SEEDIVRawTrialDataset, collate_trials, list_common_subject_ids
+    from .dataset import NUM_SEED_TRIALS, SEED_LABEL_MAP, SEEDIVRawTrialDataset, collate_trials, list_common_subject_ids
     from .logger import CSVLogger
     from .model import EEGConformerClassifier
 except ImportError:  # pragma: no cover
-    from seed_iv_2026_like_de_LDS.dataset import SEEDIVRawTrialDataset, collate_trials, list_common_subject_ids  # type: ignore
-    from seed_iv_2026_like_de_LDS.logger import CSVLogger  # type: ignore
-    from seed_iv_2026_like_de_LDS.model import EEGConformerClassifier  # type: ignore
+    from seed_2026_like_de_LDS.dataset import (  # type: ignore
+        NUM_SEED_TRIALS,
+        SEED_LABEL_MAP,
+        SEEDIVRawTrialDataset,
+        collate_trials,
+        list_common_subject_ids,
+    )
+    from seed_2026_like_de_LDS.logger import CSVLogger  # type: ignore
+    from seed_2026_like_de_LDS.model import EEGConformerClassifier  # type: ignore
+
+
+NUM_SEED_CLASSES = len(SEED_LABEL_MAP)
 
 
 def seed_everything(seed: int = 42) -> None:
@@ -116,11 +125,11 @@ def split_train_val_trial_keys(
 
     for session_id in sessions:
         for subject_id in train_subjects:
-            trials = list(range(1, 25))
+            trials = list(range(1, NUM_SEED_TRIALS + 1))
             rng.shuffle(trials)
             val_n = max(1, int(round(len(trials) * val_split)))
             val_set = set(trials[:val_n])
-            for trial_id in range(1, 25):
+            for trial_id in range(1, NUM_SEED_TRIALS + 1):
                 key = (int(session_id), int(subject_id), int(trial_id))
                 if trial_id in val_set:
                     val_keys.append(key)
@@ -239,7 +248,7 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
     )
 
     model = EEGConformerClassifier(
-        num_classes=4,
+        num_classes=NUM_SEED_CLASSES,
         channels=args.num_channel,
         bands=5,
         d_model=args.d_model,
@@ -329,7 +338,7 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
                 save_dir.mkdir(parents=True, exist_ok=True)
                 save_path = (
                     save_dir
-                    / f"seediv_e2e_conformer_testsub{test_subject:02d}_epoch{epoch:03d}_val{val_acc:.4f}.pt"
+                    / f"seed_e2e_conformer_testsub{test_subject:02d}_epoch{epoch:03d}_val{val_acc:.4f}.pt"
                 )
                 torch.save(
                     {
@@ -384,13 +393,13 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="SEED-IV raw EEG -> learnable DE-like + Conformer")
+    parser = argparse.ArgumentParser(description="SEED raw EEG -> learnable DE-like + Conformer (3-class)")
 
     parser.add_argument(
         "--root",
         type=str,
-        default="/home/aispeech/codes/zxy/SEED-IV",
-        help="Path to SEED-IV eeg_raw_data",
+        default="/home/aispeech/codes/zxy/SEED",
+        help="Path to SEED root (flat 45 .mat files + label.mat)",
     )
     parser.add_argument("--sessions", type=int, nargs="+", default=[1, 2, 3], help="e.g. 1 2 3")
 
@@ -469,7 +478,7 @@ def main() -> None:
     results_csv = (
         Path(args.results_csv)
         if args.results_csv
-        else Path(__file__).resolve().parents[1] / "results_seed_iv_2026_like_de_lds.csv"
+        else Path(__file__).resolve().parents[1] / "results_seed_2026_like_de_lds.csv"
     )
     logger = CSVLogger(
         results_csv,
