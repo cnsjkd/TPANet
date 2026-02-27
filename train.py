@@ -5,13 +5,13 @@
   完整 LOSO：
   python /home/aispeech/codes/zxy/TPANet-main/seed_2026_like_de_LDS/train.py --loso
 ==================
-python /home/aispeech/codes/zxy/TPANet-main/seed_2026_like_de_LDS/train.py \
+python /home/xiaoying/seed_2026_like_de_LDS/train.py \
     --loso \
-    --save_dir /home/aispeech/codes/zxy/TPANet-main/ckpt_seed_2026_like_de_LDS \
+    --save_dir /home/xiaoying/ckpt_seed_2026_like_de_LDS \
     --report_flops \
     --flops_windows 8 \
     --flops_batch_size 1 \
-    --results_csv /home/aispeech/codes/zxy/TPANet-main/results_seed_2026_like_de_lds_new.csv
+    --results_csv /home/xiaoying/results_seed_2026_like_de_lds_new.csv
 """
 
 from __future__ import annotations
@@ -398,7 +398,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--root",
         type=str,
-        default="/home/aispeech/codes/zxy/SEED",
+        default="/home/xiaoying/SEED",
         help="Path to SEED root (flat 45 .mat files + label.mat)",
     )
     parser.add_argument("--sessions", type=int, nargs="+", default=[1, 2, 3], help="e.g. 1 2 3")
