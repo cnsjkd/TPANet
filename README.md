@@ -78,3 +78,38 @@ python /home/aispeech/codes/zxy/TPANet-main/seed_2026_like_de_LDS/train.py \
    `/home/aispeech/codes/zxy/TPANet-main/results_seed_2026_like_de_lds.csv`
 3. CSV 额外记录：
    `total_params`, `trainable_params`, `forward_gflops`, `flops_windows`, `flops_batch_size`
+
+## 5. 轻量 Spatial GCN（可选）
+
+默认关闭。打开后会在 `DE-like` 与 `TCN` 之间加入轻量空间图卷积残差分支。
+
+### 开关与参数
+
+1. `--use_gcn`：启用 Spatial GCN。
+2. `--gcn_hidden`：GCN 隐层维度，默认 `16`。
+3. `--gcn_beta`：`I` 与学习邻接融合系数，默认 `0.2`，范围 `[0,1]`。
+4. `--gcn_dropout`：GCN 分支 dropout，默认 `0.1`。
+
+### A/B 对照建议（其余超参保持完全一致）
+
+基线（不加 GCN）：
+
+```bash
+python /home/xiaoying/seed_2026_like_de_LDS/train.py \
+  --root /home/xiaoying/SEED \
+  --loso \
+  --results_csv /home/xiaoying/results_seed_2026_like_de_lds_baseline.csv
+```
+
+GCN 版本：
+
+```bash
+python /home/xiaoying/seed_2026_like_de_LDS/train.py \
+  --root /home/xiaoying/SEED \
+  --loso \
+  --use_gcn \
+  --gcn_hidden 16 \
+  --gcn_beta 0.2 \
+  --gcn_dropout 0.1 \
+  --results_csv /home/xiaoying/results_seed_2026_like_de_lds_gcn.csv
+```

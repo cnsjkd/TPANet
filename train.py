@@ -12,6 +12,18 @@ python /home/xiaoying/seed_2026_like_de_LDS/train.py \
     --flops_windows 8 \
     --flops_batch_size 1 \
     --results_csv /home/xiaoying/results_seed_2026_like_de_lds_new.csv
+
+  - 基线：不加 --use_gcn
+  - GCN：加 --use_gcn --gcn_hidden 16 --gcn_beta 0.2 --gcn_dropout 0.1
+
+python /home/xiaoying/seed_2026_like_de_LDS/train.py \
+    --loso \
+    --save_dir /home/xiaoying/ckpt_seed_2026_like_de_LDS_GCN \
+    --report_flops \
+    --flops_windows 8 \
+    --flops_batch_size 1 \
+    --results_csv /home/xiaoying/results_seed_2026_like_de_lds_new_GCN.csv \
+    --use_gcn --gcn_hidden 16 --gcn_beta 0.2 --gcn_dropout 0.1
 """
 
 from __future__ import annotations
@@ -258,6 +270,10 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
         conv_kernel=args.conformer_conv_kernel,
         dropout=args.dropout,
         smoother_layers=args.smoother_layers,
+        use_gcn=args.use_gcn,
+        gcn_hidden=args.gcn_hidden,
+        gcn_beta=args.gcn_beta,
+        gcn_dropout=args.gcn_dropout,
     ).to(device)
 
     total_params, trainable_params = count_model_parameters(model)
@@ -421,6 +437,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_layers", type=int, default=6)
     parser.add_argument("--conformer_conv_kernel", type=int, default=15)
     parser.add_argument("--smoother_layers", type=int, default=2)
+    parser.add_argument("--use_gcn", action="store_true", help="Enable lightweight spatial GCN after DE-like")
+    parser.add_argument("--gcn_hidden", type=int, default=16, help="Hidden width for lightweight spatial GCN")
+    parser.add_argument("--gcn_beta", type=float, default=0.2, help="Identity-vs-graph mixing in spatial GCN")
+    parser.add_argument("--gcn_dropout", type=float, default=0.1, help="Dropout in lightweight spatial GCN")
     parser.add_argument(
         "--report_flops",
         action="store_true",
@@ -459,6 +479,13 @@ def main() -> None:
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
     print(f"Device: {device}")
     print(f"Sessions: {args.sessions}")
+    if args.use_gcn:
+        print(
+            f"SpatialGCN: enabled (hidden={args.gcn_hidden}, beta={args.gcn_beta}, "
+            f"dropout={args.gcn_dropout})"
+        )
+    else:
+        print("SpatialGCN: disabled")
 
     root = Path(args.root).expanduser().resolve()
     if not root.exists():

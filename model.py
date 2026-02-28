@@ -99,6 +99,60 @@ class DELike(nn.Module):
         return torch.log(var + self.eps)
 
 
+class SpatialGCNBlock(nn.Module):
+    """Lightweight spatial GCN over EEG channels (shared across bands)."""
+
+    def __init__(
+        self,
+        channels: int,
+        bands: int,
+        hidden: int = 16,
+        beta: float = 0.2,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if hidden <= 0:
+            raise ValueError("hidden must be positive")
+        if not (0.0 <= beta <= 1.0):
+            raise ValueError("beta must be in [0, 1]")
+
+        self.channels = int(channels)
+        self.bands = int(bands)
+        self.beta = float(beta)
+
+        # Bias the initial adjacency toward self-connections.
+        init_adj = 5.0 * torch.eye(self.channels, dtype=torch.float32)
+        self.adj_logits = nn.Parameter(init_adj)
+        self.lin1 = nn.Linear(1, int(hidden), bias=False)
+        self.lin2 = nn.Linear(int(hidden), 1, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self.gamma = nn.Parameter(torch.zeros(()))
+
+    def _normalized_adjacency(self, x: torch.Tensor) -> torch.Tensor:
+        logits = 0.5 * (self.adj_logits + self.adj_logits.transpose(0, 1))
+        attn = F.softmax(logits, dim=-1).to(device=x.device, dtype=x.dtype)
+        eye = torch.eye(self.channels, device=x.device, dtype=x.dtype)
+        return (1.0 - self.beta) * eye + self.beta * attn
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, C, B)
+        if x.ndim != 3 or x.size(1) != self.channels or x.size(2) != self.bands:
+            raise ValueError(
+                f"expected x shape (N,{self.channels},{self.bands}), got {tuple(x.shape)}"
+            )
+
+        a_hat = self._normalized_adjacency(x)
+        h = x.unsqueeze(-1)  # (N, C, B, 1)
+        h = torch.einsum("ij,njbf->nibf", a_hat, h)
+        h = self.lin1(h)
+        h = F.gelu(h)
+        h = self.dropout(h)
+        h = torch.einsum("ij,njbf->nibf", a_hat, h)
+        h = self.lin2(h).squeeze(-1)  # (N, C, B)
+        h = self.dropout(h)
+        return x + self.gamma * h
+
+
 class TCNSmoother(nn.Module):
     """Learnable smoothing over window axis W."""
 
@@ -154,10 +208,15 @@ class LearnableDELDSLikeFrontend(nn.Module):
         cfg: Optional[FrontendConfig] = None,
         smoother_layers: int = 2,
         dropout: float = 0.1,
+        use_gcn: bool = False,
+        gcn_hidden: int = 16,
+        gcn_beta: float = 0.2,
+        gcn_dropout: float = 0.1,
     ) -> None:
         super().__init__()
         cfg = cfg or FrontendConfig()
         self.channels = int(channels)
+        self.num_bands = len(cfg.bands_hz)
         self.filterbank = SincFilterbank(
             fs=cfg.fs,
             bands_hz=cfg.bands_hz,
@@ -166,7 +225,18 @@ class LearnableDELDSLikeFrontend(nn.Module):
             max_hz=75.0,
         )
         self.de_like = DELike()
-        self.out_dim = self.channels * len(cfg.bands_hz)
+        self.spatial_gcn = (
+            SpatialGCNBlock(
+                channels=self.channels,
+                bands=self.num_bands,
+                hidden=gcn_hidden,
+                beta=gcn_beta,
+                dropout=gcn_dropout,
+            )
+            if use_gcn
+            else nn.Identity()
+        )
+        self.out_dim = self.channels * self.num_bands
         self.smoother = TCNSmoother(dim=self.out_dim, kernel_size=5, layers=smoother_layers, dropout=dropout)
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
@@ -178,6 +248,7 @@ class LearnableDELDSLikeFrontend(nn.Module):
         x = x.reshape(batch * windows, channels, samples)
         y = self.filterbank(x)
         feat = self.de_like(y)
+        feat = self.spatial_gcn(feat)
         feat = feat.reshape(batch, windows, -1)
         return self.smoother(feat, lengths=lengths)
 
@@ -195,6 +266,10 @@ class EEGConformerClassifier(nn.Module):
         conv_kernel: int = 15,
         dropout: float = 0.1,
         smoother_layers: int = 2,
+        use_gcn: bool = False,
+        gcn_hidden: int = 16,
+        gcn_beta: float = 0.2,
+        gcn_dropout: float = 0.1,
     ) -> None:
         super().__init__()
         if Conformer is None:
@@ -205,6 +280,10 @@ class EEGConformerClassifier(nn.Module):
             cfg=FrontendConfig(bands_hz=((1, 4), (4, 8), (8, 14), (14, 31), (31, 50))),
             smoother_layers=smoother_layers,
             dropout=dropout,
+            use_gcn=use_gcn,
+            gcn_hidden=gcn_hidden,
+            gcn_beta=gcn_beta,
+            gcn_dropout=gcn_dropout,
         )
         expected_dim = channels * bands
         if self.frontend.out_dim != expected_dim:
