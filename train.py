@@ -7,23 +7,21 @@
 ==================
 python /home/xiaoying/seed_2026_like_de_LDS/train.py \
     --loso \
-    --save_dir /home/xiaoying/ckpt_seed_2026_like_de_LDS \
-    --report_flops \
-    --flops_windows 8 \
-    --flops_batch_size 1 \
-    --results_csv /home/xiaoying/results_seed_2026_like_de_lds_new.csv
-
-  - 基线：不加 --use_gcn
-  - GCN：加 --use_gcn --gcn_hidden 16 --gcn_beta 0.2 --gcn_dropout 0.1
-
-python /home/xiaoying/seed_2026_like_de_LDS/train.py \
-    --loso \
     --save_dir /home/xiaoying/ckpt_seed_2026_like_de_LDS_GCN \
     --report_flops \
     --flops_windows 8 \
     --flops_batch_size 1 \
-    --results_csv /home/xiaoying/results_seed_2026_like_de_lds_new_GCN.csv \
-    --use_gcn --gcn_hidden 16 --gcn_beta 0.2 --gcn_dropout 0.1
+    --results_csv /home/xiaoying/results_seed_2026_like_de_lds_new_GCN.csv
+
+  - 基线：加 --no_gcn
+  - GCN：默认开启，可配合 --gcn_hidden 16 --gcn_beta 0.2 --gcn_dropout 0.1
+======================
+❌-TCN smoother（--smoother_layers 0）
+python /home/aispeech/codes/zxy/TPANet-main/seed_2026_like_de_LDS/train.py \
+    --root /home/aispeech/codes/zxy/SEED \
+    --loso \
+    --smoother_layers 0 \
+    --results_csv /home/aispeech/codes/zxy/TPANet-main/results_seed_2026_like_de_lds_no_tcn.csv
 """
 
 from __future__ import annotations
@@ -437,7 +435,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_layers", type=int, default=6)
     parser.add_argument("--conformer_conv_kernel", type=int, default=15)
     parser.add_argument("--smoother_layers", type=int, default=2)
-    parser.add_argument("--use_gcn", action="store_true", help="Enable lightweight spatial GCN after DE-like")
+    gcn_group = parser.add_mutually_exclusive_group()
+    gcn_group.add_argument(
+        "--use_gcn",
+        dest="use_gcn",
+        action="store_true",
+        help="Enable lightweight spatial GCN after DE-like (default: enabled)",
+    )
+    gcn_group.add_argument("--no_gcn", dest="use_gcn", action="store_false", help="Disable lightweight spatial GCN")
+    parser.set_defaults(use_gcn=True)
     parser.add_argument("--gcn_hidden", type=int, default=16, help="Hidden width for lightweight spatial GCN")
     parser.add_argument("--gcn_beta", type=float, default=0.2, help="Identity-vs-graph mixing in spatial GCN")
     parser.add_argument("--gcn_dropout", type=float, default=0.1, help="Dropout in lightweight spatial GCN")

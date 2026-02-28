@@ -81,23 +81,25 @@ python /home/aispeech/codes/zxy/TPANet-main/seed_2026_like_de_LDS/train.py \
 
 ## 5. 轻量 Spatial GCN（可选）
 
-默认关闭。打开后会在 `DE-like` 与 `TCN` 之间加入轻量空间图卷积残差分支。
+默认开启，会在 `DE-like` 与 `TCN` 之间加入轻量空间图卷积残差分支。
 
 ### 开关与参数
 
-1. `--use_gcn`：启用 Spatial GCN。
-2. `--gcn_hidden`：GCN 隐层维度，默认 `16`。
-3. `--gcn_beta`：`I` 与学习邻接融合系数，默认 `0.2`，范围 `[0,1]`。
-4. `--gcn_dropout`：GCN 分支 dropout，默认 `0.1`。
+1. `--use_gcn`：显式启用 Spatial GCN（默认已启用）。
+2. `--no_gcn`：关闭 Spatial GCN（用于基线对照）。
+3. `--gcn_hidden`：GCN 隐层维度，默认 `16`。
+4. `--gcn_beta`：`I` 与学习邻接融合系数，默认 `0.2`，范围 `[0,1]`。
+5. `--gcn_dropout`：GCN 分支 dropout，默认 `0.1`。
 
 ### A/B 对照建议（其余超参保持完全一致）
 
-基线（不加 GCN）：
+基线（关闭 GCN）：
 
 ```bash
 python /home/xiaoying/seed_2026_like_de_LDS/train.py \
   --root /home/xiaoying/SEED \
   --loso \
+  --no_gcn \
   --results_csv /home/xiaoying/results_seed_2026_like_de_lds_baseline.csv
 ```
 
@@ -107,7 +109,6 @@ GCN 版本：
 python /home/xiaoying/seed_2026_like_de_LDS/train.py \
   --root /home/xiaoying/SEED \
   --loso \
-  --use_gcn \
   --gcn_hidden 16 \
   --gcn_beta 0.2 \
   --gcn_dropout 0.1 \
