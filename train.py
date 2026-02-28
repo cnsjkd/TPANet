@@ -1,9 +1,13 @@
 """
-  单 fold:：
-  python /home/aispeech/codes/zxy/TPANet-main/seed_iv_2026_like_de_LDS/train.py --test_subject 1
-
-  完整 LOSO：
-  python /home/aispeech/codes/zxy/TPANet-main/seed_iv_2026_like_de_LDS/train.py --loso
+  python /home/aispeech/codes/zxy/TPANet-main/seed_iv_2026_like_de_LDS/train.py \
+    --root /home/aispeech/codes/zxy/SEED-IV \
+    --loso \
+    --use_gcn \
+    --gcn_hidden 16 \
+    --gcn_beta 0.2 \
+    --gcn_dropout 0.1 \
+    --save_dir /home/aispeech/codes/zxy/TPANet-main/ckpt_seed_iv_2026_like_de_LDS_gcn \
+    --results_csv /home/aispeech/codes/zxy/TPANet-main/results_seed_iv_2026_like_de_lds_gcn.csv
 """
 
 from __future__ import annotations
@@ -25,11 +29,17 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(module_dir.parent))
 
 try:
-    from .dataset import SEEDIVRawTrialDataset, collate_trials, list_common_subject_ids
+    from .dataset import NUM_SEED_IV_CLASSES, NUM_SEED_IV_TRIALS, SEEDIVRawTrialDataset, collate_trials, list_common_subject_ids
     from .logger import CSVLogger
     from .model import EEGConformerClassifier
 except ImportError:  # pragma: no cover
-    from seed_iv_2026_like_de_LDS.dataset import SEEDIVRawTrialDataset, collate_trials, list_common_subject_ids  # type: ignore
+    from seed_iv_2026_like_de_LDS.dataset import (  # type: ignore
+        NUM_SEED_IV_CLASSES,
+        NUM_SEED_IV_TRIALS,
+        SEEDIVRawTrialDataset,
+        collate_trials,
+        list_common_subject_ids,
+    )
     from seed_iv_2026_like_de_LDS.logger import CSVLogger  # type: ignore
     from seed_iv_2026_like_de_LDS.model import EEGConformerClassifier  # type: ignore
 
@@ -40,6 +50,57 @@ def seed_everything(seed: int = 42) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = True
+
+
+def count_model_parameters(model: nn.Module) -> Tuple[int, int]:
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return int(total_params), int(trainable_params)
+
+
+@torch.no_grad()
+def estimate_forward_flops(
+    model: nn.Module,
+    device: torch.device,
+    num_channel: int,
+    chunk_size: int,
+    windows: int,
+    batch_size: int,
+) -> float:
+    try:
+        from torch.profiler import ProfilerActivity, profile
+    except Exception:
+        return float("nan")
+
+    windows = int(windows)
+    batch_size = int(batch_size)
+    if windows <= 0 or batch_size <= 0:
+        return float("nan")
+
+    was_training = model.training
+    model.eval()
+
+    x = torch.randn(batch_size, windows, int(num_channel), int(chunk_size), device=device)
+    lengths = torch.full((batch_size,), windows, dtype=torch.long, device=device)
+    activities = [ProfilerActivity.CPU]
+    if device.type == "cuda":
+        activities.append(ProfilerActivity.CUDA)
+
+    try:
+        with profile(activities=activities, with_flops=True, record_shapes=False) as prof:
+            _ = model(x, lengths)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        total_flops = 0.0
+        for evt in prof.key_averages():
+            total_flops += float(getattr(evt, "flops", 0.0) or 0.0)
+    except Exception:
+        total_flops = float("nan")
+    finally:
+        if was_training:
+            model.train()
+
+    return float(total_flops)
 
 
 def split_train_val_trial_keys(
@@ -57,11 +118,11 @@ def split_train_val_trial_keys(
 
     for session_id in sessions:
         for subject_id in train_subjects:
-            trials = list(range(1, 25))
+            trials = list(range(1, NUM_SEED_IV_TRIALS + 1))
             rng.shuffle(trials)
             val_n = max(1, int(round(len(trials) * val_split)))
             val_set = set(trials[:val_n])
-            for trial_id in range(1, 25):
+            for trial_id in range(1, NUM_SEED_IV_TRIALS + 1):
                 key = (int(session_id), int(subject_id), int(trial_id))
                 if trial_id in val_set:
                     val_keys.append(key)
@@ -180,7 +241,7 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
     )
 
     model = EEGConformerClassifier(
-        num_classes=4,
+        num_classes=NUM_SEED_IV_CLASSES,
         channels=args.num_channel,
         bands=5,
         d_model=args.d_model,
@@ -190,7 +251,29 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
         conv_kernel=args.conformer_conv_kernel,
         dropout=args.dropout,
         smoother_layers=args.smoother_layers,
+        use_gcn=args.use_gcn,
+        gcn_hidden=args.gcn_hidden,
+        gcn_beta=args.gcn_beta,
+        gcn_dropout=args.gcn_dropout,
     ).to(device)
+
+    total_params, trainable_params = count_model_parameters(model)
+    if args.report_flops:
+        forward_flops = estimate_forward_flops(
+            model=model,
+            device=device,
+            num_channel=args.num_channel,
+            chunk_size=args.chunk_size,
+            windows=args.flops_windows,
+            batch_size=args.flops_batch_size,
+        )
+    else:
+        forward_flops = float("nan")
+    forward_gflops = forward_flops / 1e9 if np.isfinite(forward_flops) else float("nan")
+    print(
+        f"[sub{test_subject:02d}] params total={total_params:,} trainable={trainable_params:,} "
+        f"forward_gflops={'nan' if not np.isfinite(forward_gflops) else f'{forward_gflops:.4f}'}"
+    )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = (
@@ -261,6 +344,12 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
                         "test_subject": test_subject,
                         "best_epoch": best_epoch,
                         "best_val_acc": best_val_acc,
+                        "total_params": total_params,
+                        "trainable_params": trainable_params,
+                        "forward_flops": forward_flops,
+                        "forward_gflops": forward_gflops,
+                        "flops_windows": int(args.flops_windows),
+                        "flops_batch_size": int(args.flops_batch_size),
                     },
                     save_path,
                 )
@@ -294,6 +383,9 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
         "test_acc": float(test_acc),
         "best_epoch": float(best_epoch),
         "seconds": float(elapsed),
+        "total_params": float(total_params),
+        "trainable_params": float(trainable_params),
+        "forward_gflops": float(forward_gflops),
     }
 
 
@@ -326,6 +418,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_layers", type=int, default=6)
     parser.add_argument("--conformer_conv_kernel", type=int, default=15)
     parser.add_argument("--smoother_layers", type=int, default=2)
+    parser.add_argument("--use_gcn", action="store_true", help="Enable lightweight spatial GCN after DE-like")
+    parser.add_argument("--gcn_hidden", type=int, default=16, help="Hidden width for lightweight spatial GCN")
+    parser.add_argument("--gcn_beta", type=float, default=0.2, help="Identity-vs-graph mixing in spatial GCN")
+    parser.add_argument("--gcn_dropout", type=float, default=0.1, help="Dropout in lightweight spatial GCN")
+    parser.add_argument(
+        "--report_flops",
+        action="store_true",
+        help="Estimate forward FLOPs with torch.profiler on a dummy input",
+    )
+    parser.add_argument("--flops_windows", type=int, default=8, help="Dummy window count for FLOPs estimation")
+    parser.add_argument("--flops_batch_size", type=int, default=1, help="Dummy batch size for FLOPs estimation")
 
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--cache_dir", type=str, default=None)
@@ -357,6 +460,13 @@ def main() -> None:
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
     print(f"Device: {device}")
     print(f"Sessions: {args.sessions}")
+    if args.use_gcn:
+        print(
+            f"SpatialGCN: enabled (hidden={args.gcn_hidden}, beta={args.gcn_beta}, "
+            f"dropout={args.gcn_dropout})"
+        )
+    else:
+        print("SpatialGCN: disabled")
 
     root = Path(args.root).expanduser().resolve()
     if not root.exists():
@@ -397,6 +507,11 @@ def main() -> None:
             "d_model",
             "num_layers",
             "num_heads",
+            "total_params",
+            "trainable_params",
+            "forward_gflops",
+            "flops_windows",
+            "flops_batch_size",
         ],
     )
 
@@ -426,6 +541,11 @@ def main() -> None:
                 args.d_model,
                 args.num_layers,
                 args.num_heads,
+                int(result["total_params"]),
+                int(result["trainable_params"]),
+                f"{result['forward_gflops']:.4f}",
+                args.flops_windows,
+                args.flops_batch_size,
             ]
         )
 
