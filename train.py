@@ -17,11 +17,20 @@ python /home/xiaoying/seed_2026_like_de_LDS/train.py \
   - GCN：默认开启，可配合 --gcn_hidden 16 --gcn_beta 0.2 --gcn_dropout 0.1
 ======================
 ❌-TCN smoother（--smoother_layers 0）
-python /home/aispeech/codes/zxy/TPANet-main/seed_2026_like_de_LDS/train.py \
-    --root /home/aispeech/codes/zxy/SEED \
+python /data/Codes/xiaoying/work2/seed_2026_like_de_LDS/train.py \
+    --root /data/Codes/xiaoying/work2/SEED \
     --loso \
     --smoother_layers 0 \
-    --results_csv /home/aispeech/codes/zxy/TPANet-main/results_seed_2026_like_de_lds_no_tcn.csv
+    --results_csv /data/Codes/xiaoying/work2/seed_2026_like_de_LDS/results_seed_2026_like_de_lds_no_tcn.csv
+修复报错命令：
+CUDA_LAUNCH_BLOCKING=1 python /data/Codes/xiaoying/work2/seed_2026_like_de_LDS/train.py \
+    --root /data/Codes/xiaoying/work2/SEED \
+    --loso \
+    --smoother_layers 0 \
+    --results_csv /data/Codes/xiaoying/work2/seed_2026_like_de_LDS/results_seed_2026_like_de_lds_no_tcn.csv \
+    --cuda_sync_debug \
+    --no_cudnn \
+    --num_workers 0
 """
 
 from __future__ import annotations
@@ -66,7 +75,9 @@ def seed_everything(seed: int = 42) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = True
+    # Variable-length EEG windows produce many different tensor shapes.
+    # Disabling benchmark avoids unstable algo auto-tuning across shapes.
+    torch.backends.cudnn.benchmark = False
 
 
 def count_model_parameters(model: nn.Module) -> Tuple[int, int]:
@@ -314,7 +325,34 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
         running_correct = 0
         running_count = 0
 
-        for x, lengths, y, _ in train_loader:
+        for step, (x, lengths, y, metas) in enumerate(train_loader, start=1):
+            if x.ndim != 4:
+                raise ValueError(f"expected x to be 4D (B,W,C,T), got shape={tuple(x.shape)}")
+            if lengths.ndim != 1 or lengths.numel() != x.size(0):
+                raise ValueError(
+                    f"invalid lengths shape={tuple(lengths.shape)} for batch size={x.size(0)}"
+                )
+            if y.ndim != 1 or y.numel() != x.size(0):
+                raise ValueError(f"invalid y shape={tuple(y.shape)} for batch size={x.size(0)}")
+
+            y_min = int(y.min().item())
+            y_max = int(y.max().item())
+            if y_min < 0 or y_max >= NUM_SEED_CLASSES:
+                example_meta = metas[0] if metas else "N/A"
+                raise ValueError(
+                    f"target out of range for CrossEntropyLoss: min={y_min}, max={y_max}, "
+                    f"expected in [0,{NUM_SEED_CLASSES - 1}], "
+                    f"epoch={epoch}, step={step}, example_meta={example_meta}"
+                )
+
+            len_min = int(lengths.min().item())
+            len_max = int(lengths.max().item())
+            if len_min <= 0 or len_max > x.size(1):
+                raise ValueError(
+                    f"invalid lengths in batch: min={len_min}, max={len_max}, "
+                    f"max_windows={x.size(1)}, epoch={epoch}, step={step}"
+                )
+
             x = x.to(device, non_blocking=True)
             lengths = lengths.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
@@ -322,14 +360,31 @@ def train_one_fold(args: argparse.Namespace, test_subject: int, device: torch.de
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=args.amp and device.type == "cuda"):
                 logits = model(x, lengths)
+                if logits.ndim != 2 or logits.size(0) != y.size(0) or logits.size(1) != NUM_SEED_CLASSES:
+                    raise ValueError(
+                        f"invalid logits shape={tuple(logits.shape)}, expected "
+                        f"(B,{NUM_SEED_CLASSES}) with B={y.size(0)}"
+                    )
                 loss = criterion(logits, y)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(
+                        f"non-finite loss detected: loss={loss.detach().float().item()}, "
+                        f"epoch={epoch}, step={step}"
+                    )
+
+            if args.cuda_sync_debug and device.type == "cuda":
+                torch.cuda.synchronize(device)
 
             scaler.scale(loss).backward()
+            if args.cuda_sync_debug and device.type == "cuda":
+                torch.cuda.synchronize(device)
             if args.grad_clip > 0:
                 scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
+            if args.cuda_sync_debug and device.type == "cuda":
+                torch.cuda.synchronize(device)
 
             running_loss += float(loss.item()) * y.size(0)
             running_correct += int((logits.detach().argmax(dim=-1) == y).sum().item())
@@ -473,6 +528,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log_every", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--cuda_sync_debug",
+        action="store_true",
+        help="Synchronize CUDA after forward/backward/step to surface the real failing op",
+    )
+    parser.add_argument(
+        "--no_cudnn",
+        action="store_true",
+        help="Disable cuDNN kernels (slower but can avoid cuDNN launch failures)",
+    )
 
     return parser.parse_args()
 
@@ -481,6 +546,8 @@ def main() -> None:
     args = parse_args()
 
     seed_everything(args.seed)
+    if args.no_cudnn:
+        torch.backends.cudnn.enabled = False
 
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
     print(f"Device: {device}")
